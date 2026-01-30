@@ -11,11 +11,11 @@ from typing import List, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-for results_dir in os.listdir('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/'):
+for results_dir in os.listdir('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/stratified_subsampling'):
     
     dataset_name = results_dir
     #Check if results file exists
-    result_path = os.path.join('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/', results_dir, 'results.pkl')
+    result_path = os.path.join('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/stratified_subsampling', results_dir, 'results.pkl')
     if os.path.exists(result_path):
         with open(result_path, 'rb') as f:
             results_dict = pickle.load(f)

@@ -19,6 +19,7 @@ import scipy.stats
 from tqdm import tqdm
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
+import time
 
 def plot_highlighted_embeddings(embeddings, labels, title, filename, top_k_indices, bottom_k_indices, k, save_directory='representation_visualizations'):
     """Helper function to plot embeddings with highlighted top/bottom k samples."""
@@ -226,8 +227,8 @@ if __name__ == "__main__":
             print("Skipping regression or multi-class task.")
             continue
 
-        if dataset.qualities['NumberOfFeatures'] > 500:
-            print("Skipping dataset with more than 500 features.")
+        if dataset.qualities['NumberOfFeatures'] > 100:
+            print("Skipping dataset with more than 100 features.")
             continue
         
         print(f"Task ID: {task.id}, Dataset ID: {dataset.id}, Dataset Name: {dataset.name}")
@@ -307,7 +308,7 @@ if __name__ == "__main__":
                 if pos_class == 'True':
                     pos_class = True
 
-                max_train_samples = 2000
+                max_train_samples = 1000
                 max_test_samples = 500
                 #Sample only max_samples from train and test sets
                 if X_train.shape[0] > max_train_samples:
@@ -321,137 +322,60 @@ if __name__ == "__main__":
                     y_test = y_test.loc[test_indices].reset_index(drop=True)
 
 
-                clf = TabICLClassifier(n_estimators=1, random_state=seed)
-                clf.fit(X_train, y_train)  # this is cheap
-
-                #res, rollout = clf.predict_with_rollout(X_test, return_row_emb=True)
-                probs, rollout = clf.predict_proba_with_rollout(X_test, return_row_emb=visualize)
-
-                preds = np.argmax(probs, axis=1)
-                res = clf.y_encoder_.inverse_transform(preds)
-
-                full_set_f1 = f1_score(y_test, res, zero_division=0, pos_label=pos_class)
-                full_set_roc_auc = roc_auc_score(y_test, probs[:, 1])
-
-                #We take the first element because n_estimators=1. If this is higher you get one rollout per estimator.
-                #I realize that this might have an effect on the 'row_emb_rollout' since they permute the columns, but
-                #it should not affect the 'icl' rollout.
-                rollout_icl = rollout['icl_rollout'][0]
-
-                #Average attention on training samples by test samples
-                #The batch size is 1 in our case, so we take the first element
-                test_to_train_attention = rollout_icl[0, X_train.shape[0]:, :X_train.shape[0]]
-                average_attention = np.mean(test_to_train_attention, axis=0)
-                sorted_indices = np.argsort(average_attention)
+                print(X_train.shape)
                 
-                if save_attention:
-                    results_dict['test_to_train_attention_matrices'].append(test_to_train_attention)
+                # Run with k=1000
+                print("\n--- Running with k=1000 ---")
+                clf_k1000 = TabICLClassifier(n_estimators=1, random_state=seed, k=100)
+                clf_k1000.fit(X_train, y_train)  # this is cheap
 
-                metric = 'cosine_sim'
-                mean_sim = estimate_attention_similarities(test_to_train_attention, subsample_size=100, seed=seed, metric=metric)
-                results_dict['cosine_similarities'][repeat].append(mean_sim)
+                start_time = time.time()
+                probs_k1000 = clf_k1000.predict_proba(X_test)
+                end_time = time.time()
+                time_k1000 = end_time - start_time
+                print(f"Prediction time with k=1000 ({X_train.shape[0]} training samples): {time_k1000:.4f} seconds")
 
+                preds_k1000 = np.argmax(probs_k1000, axis=1)
+                res_k1000 = clf_k1000.y_encoder_.inverse_transform(preds_k1000)
 
-                #Get binary encoded y_train
-                y_train_binary = np.array([1 if label == pos_class else 0 for label in y_train])
+                f1_k1000 = f1_score(y_test, res_k1000, zero_division=0, pos_label=pos_class)
+                roc_auc_k1000 = roc_auc_score(y_test, probs_k1000[:, 1])
                 
-                if visualize:
-                    create_representation_plots(sorted_indices, 20, rollout['row_embeddings'][0][0][:X_train.shape[0]], y_train_binary, seed, save_directory=f'{output_dir}/{dataset.name}/representation_visualizations')
+                print(f"  k=1000 Results: F1={f1_k1000:.4f}, ROC AUC={roc_auc_k1000:.4f}")
 
-                avg_attention_and_label = list(zip(average_attention, y_train_binary))
+                # Run with k=None
+                print("\n--- Running with k=None ---")
+                try:
+                    clf_kNone = TabICLClassifier(n_estimators=1, random_state=seed, k=None)
+                    clf_kNone.fit(X_train, y_train)
 
-                if stratified_subsampling:
-                    #Separate positive and negative samples
-                    sorted_positive = sorted([(i, att) for i, (att, label) in enumerate(avg_attention_and_label) if label == 1], key=lambda x: x[1], reverse=True)
-                    sorted_negative = sorted([(i, att) for i, (att, label) in enumerate(avg_attention_and_label) if label != 1], key=lambda x: x[1], reverse=True)
+                    start_time = time.time()
+                    probs_kNone = clf_kNone.predict_proba(X_test)
+                    end_time = time.time()
+                    time_kNone = end_time - start_time
+                    print(f"Prediction time with k=None ({X_train.shape[0]} training samples): {time_kNone:.4f} seconds")
 
-                    top_k_positive_indices = [idx for idx, _ in sorted_positive[:int(k * len(sorted_positive))]]
-                    top_k_negative_indices = [idx for idx, _ in sorted_negative[:int(k * len(sorted_negative))]]
+                    preds_kNone = np.argmax(probs_kNone, axis=1)
+                    res_kNone = clf_kNone.y_encoder_.inverse_transform(preds_kNone)
 
-                    bottom_k_positive_indices = [idx for idx, _ in sorted_positive[-int(k * len(sorted_positive)):]]
-                    bottom_k_negative_indices = [idx for idx, _ in sorted_negative[-int(k * len(sorted_negative)):]]
+                    f1_kNone = f1_score(y_test, res_kNone, zero_division=0, pos_label=pos_class)
+                    roc_auc_kNone = roc_auc_score(y_test, probs_kNone[:, 1])
+                    
+                    print(f"  k=None Results: F1={f1_kNone:.4f}, ROC AUC={roc_auc_kNone:.4f}")
+                    
+                    # Comparison
+                    print("\n--- Comparison ---")
+                    print(f"  F1 difference (k=None - k=1000): {f1_kNone - f1_k1000:.4f}")
+                    print(f"  ROC AUC difference (k=None - k=1000): {roc_auc_kNone - roc_auc_k1000:.4f}")
+                    print(f"  Time difference (k=None - k=1000): {time_kNone - time_k1000:.4f} seconds")
+                    print(f"  Speedup with k=1000: {time_kNone / time_k1000:.2f}x")
+                    
+                except Exception as e:
+                    print(f"  ERROR with k=None: {type(e).__name__}: {str(e)}")
+                    print(f"  Continuing with k=1000 results only")
 
-                    top_k_indices = np.array(top_k_positive_indices + top_k_negative_indices)
-                    bot_k_indices = np.array(bottom_k_positive_indices + bottom_k_negative_indices)
-
-                    # Stratified random variants: sample positives and negatives separately to preserve balance
-                    pos_indices = np.array([i for i, lbl in enumerate(y_train_binary) if lbl == 1])
-                    neg_indices = np.array([i for i, lbl in enumerate(y_train_binary) if lbl == 0])
-
-                    pos_sample_size = min(len(pos_indices), max(1, int(k * len(pos_indices))))
-                    neg_sample_size = min(len(neg_indices), max(1, int(k * len(neg_indices))))
-
-                    # Uniform stratified random
-                    random_pos = r.choice(pos_indices, size=pos_sample_size, replace=False)
-                    random_neg = r.choice(neg_indices, size=neg_sample_size, replace=False)
-                    random_k_indices = np.concatenate([random_pos, random_neg])
-
-                    # Attention-weighted stratified random
-                    att_pos = average_attention[pos_indices]
-                    att_neg = average_attention[neg_indices]
-                    prob_pos = att_pos / att_pos.sum()
-                    prob_neg = att_neg / att_neg.sum()
-                    weighted_pos = r.choice(pos_indices, size=pos_sample_size, replace=False, p=prob_pos)
-                    weighted_neg = r.choice(neg_indices, size=neg_sample_size, replace=False, p=prob_neg)
-                    weighted_random_k_indices = np.concatenate([weighted_pos, weighted_neg])
-
-                    # Inverse-attention-weighted stratified random
-                    inv_att_pos = 1 / att_pos
-                    inv_att_neg = 1 / att_neg
-                    prob_pos_inv = inv_att_pos / inv_att_pos.sum()
-                    prob_neg_inv = inv_att_neg / inv_att_neg.sum()
-                    inverse_weighted_pos = r.choice(pos_indices, size=pos_sample_size, replace=False, p=prob_pos_inv)
-                    inverse_weighted_neg = r.choice(neg_indices, size=neg_sample_size, replace=False, p=prob_neg_inv)
-                    inverse_weighted_random_k_indices = np.concatenate([inverse_weighted_pos, inverse_weighted_neg])
-
-                else:
-                    top_k_indices = sorted_indices[-int(k * X_train.shape[0]):]
-                    bot_k_indices = sorted_indices[:int(k * X_train.shape[0])]
-
-                    random_k_indices = r.choice(X_train.shape[0], size=top_k_indices.shape[0], replace=False)
-                
-                    #Sample random indices with probability proportional to average attention (more likely to sample high attention)
-                    attention_probabilities = average_attention / np.sum(average_attention)
-                    weighted_random_k_indices = r.choice(X_train.shape[0], size=top_k_indices.shape[0], replace=False, p=attention_probabilities)
-
-                    #Sample random indices with probability INVERSLY proportional to average attention (more likely to sample low attention)
-                    weights = 1 / average_attention
-                    inverse_attention_probabilities = weights / np.sum(weights)
-                    inverse_weighted_random_k_indices = r.choice(X_train.shape[0], size=top_k_indices.shape[0], replace=False, p=inverse_attention_probabilities)
-
-                top_k_f1, top_k_roc_auc = train_and_score_model_on_subset(
-                    X_train, y_train, X_test, y_test, subset_indices=top_k_indices, n_estimators=1, random_state=0, pos_label=pos_class
-                )
-                bot_k_f1, bot_k_roc_auc = train_and_score_model_on_subset(
-                    X_train, y_train, X_test, y_test, subset_indices=bot_k_indices, n_estimators=1, random_state=0, pos_label=pos_class
-                )
-                random_k_f1, random_k_roc_auc = train_and_score_model_on_subset(
-                    X_train, y_train, X_test, y_test, subset_indices=random_k_indices, n_estimators=1, random_state=0, pos_label=pos_class
-                )
-
-                weighted_random_k_f1, weighted_random_k_roc_auc = train_and_score_model_on_subset(
-                    X_train, y_train, X_test, y_test, subset_indices=weighted_random_k_indices, n_estimators=1, random_state=0, pos_label=pos_class
-                )
-
-
-                inversly_weighted_random_k_f1, inversly_weighted_random_k_roc_auc = train_and_score_model_on_subset(
-                    X_train, y_train, X_test, y_test, subset_indices=inverse_weighted_random_k_indices, n_estimators=1, random_state=0, pos_label=pos_class
-                )
-
-                #Store results
-                results_dict['full_set']['f1s'][repeat].append(full_set_f1)
-                results_dict['top_k']['f1s'][repeat].append(top_k_f1)
-                results_dict['bot_k']['f1s'][repeat].append(bot_k_f1)
-                results_dict['random_k']['f1s'][repeat].append(random_k_f1)
-                results_dict['weighted_random_k']['f1s'][repeat].append(weighted_random_k_f1)
-                results_dict['inversly_weighted_random_k']['f1s'][repeat].append(inversly_weighted_random_k_f1)
-                results_dict['full_set']['roc_aucs'][repeat].append(full_set_roc_auc)
-                results_dict['top_k']['roc_aucs'][repeat].append(top_k_roc_auc)
-                results_dict['bot_k']['roc_aucs'][repeat].append(bot_k_roc_auc)
-                results_dict['random_k']['roc_aucs'][repeat].append(random_k_roc_auc)
-                results_dict['weighted_random_k']['roc_aucs'][repeat].append(weighted_random_k_roc_auc)
-                results_dict['inversly_weighted_random_k']['roc_aucs'][repeat].append(inversly_weighted_random_k_roc_auc)
+                print(f"\n  Repeat {repeat}, Fold {fold} Summary | k=1000: F1={f1_k1000:.4f}, ROC AUC={roc_auc_k1000:.4f}")
         
         #save results_dict
-        with open(f'{output_dir}/{dataset.name}/results.pkl', 'wb') as f:
-            pickle.dump(results_dict, f)
+        #with open(f'{output_dir}/{dataset.name}/results.pkl', 'wb') as f:
+        #    pickle.dump(results_dict, f)

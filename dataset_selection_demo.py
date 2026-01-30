@@ -219,6 +219,8 @@ if __name__ == "__main__":
         average_attention = np.mean(rollout_icl[0, X_train.shape[0]:, :X_train.shape[0]], axis=0)
         sorted_indices = np.argsort(average_attention)
 
+        #breakpoint()
+
         if args.create_representation_plots:
             create_representation_plots(sorted_indices, 20, rollout['row_embeddings'][0][0][:X_train.shape[0]], y_train, plot_directory, seed)
 

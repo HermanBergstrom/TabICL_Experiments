@@ -6,6 +6,11 @@ tab_icl_env
 subset_results
 bash_scripts
 tabarena_results*
+datasets
+debugging
+token.sh
+extracted_features/
+model_weights/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

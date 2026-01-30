@@ -15,6 +15,11 @@ def parse_args():
         action="store_true",
         help="Use standard error instead of standard deviation for error bars",
     )
+    parser.add_argument(
+        "--stratified-subsampling",
+        action="store_true",
+        help="Whether to use stratified subsampling when limiting training samples",
+    )
     return parser.parse_args()
 
 from typing import List, Tuple
@@ -45,15 +50,20 @@ def aggregate_auroc(
 
 args = parse_args()
 use_std_error = args.use_std_error
+stratified_subsampling = args.stratified_subsampling
 
 # Collect all results
 all_results = {}
 k_value = None
 
-for results_dir in os.listdir('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/'):
+
+root_dir = '/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/'
+results_base_dir = 'tabarena_results/stratified_subsampling' if stratified_subsampling else 'tabarena_results/standard_subsampling'
+
+for results_dir in os.listdir(f'{root_dir}{results_base_dir}/'):
     dataset_name = results_dir
     #Check if results file exists
-    result_path = os.path.join('/home/hermanb/projects/aip-rahulgk/hermanb/TabICL_Experiments/tabarena_results/', results_dir, 'results.pkl')
+    result_path = os.path.join(f'{root_dir}{results_base_dir}/', results_dir, 'results.pkl')
     if os.path.exists(result_path):
         with open(result_path, 'rb') as f:
             results_dict = pickle.load(f)
@@ -127,8 +137,31 @@ for idx, (dataset_name, results_dict) in enumerate(sorted(all_results.items())):
     
     ax.set_xlabel('Method', fontsize=10, fontweight='bold')
     ax.set_ylabel('ROC AUC', fontsize=10, fontweight='bold')
-    # Add seed count to title (same for all methods)
-    ax.set_title(f"{dataset_name} (repeats = {counts[0] if counts else 0}, folds = {folds[0] if folds else 0})", fontsize=12, fontweight='bold')
+    # Two-line title: dataset name on first line; class balance + folds/repeats on second line
+    metadata = results_dict.get('metadata', {}) if isinstance(results_dict, dict) else {}
+    qualities = metadata.get('dataset_qualities', {}) if isinstance(metadata, dict) else {}
+    majority_size = qualities.get('majority_class_size')
+    minority_size = qualities.get('minority_class_size')
+    majority_fraction = majority_size / (majority_size + minority_size)
+    minority_fraction = minority_size / (majority_size + minority_size)
+    class_balance = ""
+    if majority_fraction is not None and minority_fraction is not None:
+        class_balance = f"Balance: majority={majority_fraction * 100:.1f}%, minority={minority_fraction * 100:.1f}%"
+
+    repeats_val = counts[0] if counts else 0
+    folds_val = folds[0] if folds else 0
+    second_line_parts = [part for part in [class_balance, f"folds={folds_val}", f"repeats={repeats_val}"] if part]
+    second_line = " | ".join(second_line_parts)
+    ax.set_title(dataset_name, fontsize=12, fontweight='bold', pad=18)
+    ax.text(
+        0.5,
+        1.01,
+        second_line,
+        transform=ax.transAxes,
+        ha='center',
+        va='bottom',
+        fontsize=9,
+    )
     ax.set_xticks(x_pos)
     ax.set_xticklabels(wrapped_method_labels, rotation=0, ha='center', fontsize=10)
     ax.grid(axis='y', alpha=0.3, linestyle='--')
@@ -154,6 +187,7 @@ title_text = f"ROC AUC by Method (K={int(k_value * 100)}%)" if k_value is not No
 fig.suptitle(title_text, fontsize=16, fontweight='bold')
 
 plt.tight_layout(rect=(0, 0, 1, 0.96))
-plt.savefig('results_histograms.png', dpi=300, bbox_inches='tight')
-print("Plot saved as results_histograms.png")
+output_name = 'results_histograms_stratified.pdf' if stratified_subsampling else 'results_histograms_standard.pdf'
+plt.savefig(output_name, dpi=300, bbox_inches='tight')
+print(f"Plot saved as {output_name}")
 plt.show()
