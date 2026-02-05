@@ -99,7 +99,7 @@ class PaintingsPricePredictionDataset(Dataset):
 class COVID19ChestXrayDataset(Dataset):
     """
     COVID-19 Chest X-ray Dataset.
-    Binary classification: COVID-19 vs. No findings
+    Binary classification: COVID-19 vs. other findings
     Contains clinical metadata and X-ray images.
     """
     
@@ -107,7 +107,6 @@ class COVID19ChestXrayDataset(Dataset):
         self,
         data_dir: str = "datasets/covid19-chest-xray",
         image_transform: Optional[transforms.Compose] = None,
-        finding: str = "COVID-19",  # Can filter by specific finding
     ):
         self.data_dir = Path(data_dir)
         self.metadata_path = self.data_dir / "metadata.csv"
@@ -115,8 +114,8 @@ class COVID19ChestXrayDataset(Dataset):
         
         self.df = pd.read_csv(self.metadata_path)
         
-        # Filter by finding type
-        self.df = self.df[self.df['finding'] == finding].reset_index(drop=True)
+        # Create binary labels: 1 for COVID-19, 0 for all other findings
+        self.df['label'] = (self.df['finding'] == 'COVID-19').astype(int)
         
         self.image_transform = image_transform or transforms.Compose([
             transforms.Resize((224, 224)),
@@ -146,7 +145,7 @@ class COVID19ChestXrayDataset(Dataset):
             'RT_PCR_positive': 1 if row['RT_PCR_positive'] == 'Y' else 0,
         }
         data['clinical_features'] = clinical_features
-        data['target'] = torch.tensor(1, dtype=torch.long)  # COVID-19 positive
+        data['target'] = torch.tensor(row['label'], dtype=torch.long)
         
         return data
 
@@ -167,18 +166,11 @@ class SkinCancerDataset(Dataset):
         self.metadata_path = self.data_dir / "metadata.csv"
         
         self.df = pd.read_csv(self.metadata_path)
-        print(self.df.columns)
 
-        # Map diagnostic to class labels
-        self.diagnosis_to_id = {
-            'MEL': 0,   # Melanoma
-            'NV': 1,    # Nevus
-            'BCC': 2,   # Basal Cell Carcinoma
-            'AKIEC': 3, # Actinic Keratosis
-            'BKL': 4,   # Benign Keratosis
-            'DF': 5,    # Dermatofibroma
-            'VASC': 6   # Vascular
-        }
+        #Get unique diagnostic labels
+        self.diagnostic_labels = self.df['diagnostic'].unique().tolist()
+        self.diagnosis_to_id = {label: idx for idx, label in enumerate(self.diagnostic_labels)}
+        self.id_to_diagnosis = {idx: label for label, idx in self.diagnosis_to_id.items()}
         
         #TODO: Double check handling of missing values
         # Encode categorical columns
@@ -187,8 +179,15 @@ class SkinCancerDataset(Dataset):
         'cancer_history', 'has_piped_water','has_sewage_system', 'itch', 'grew', 'hurt', 
         'changed', 'bleed', 'elevation']
 
-        self.df = pd.get_dummies(self.df, columns=categorical_cols, prefix=categorical_cols)
+        #Perform mean imputation on diameter_1 and diameter_2 columns
+        self.df['diameter_1'].fillna(self.df['diameter_1'].mean(), inplace=True)
+        self.df['diameter_2'].fillna(self.df['diameter_2'].mean(), inplace=True)
+
+        ##With missing
+        self.df = pd.get_dummies(self.df, columns=categorical_cols, prefix=categorical_cols, dummy_na=True)
         
+        #print(df.head())
+
         self.image_dirs = [
             self.data_dir / "imgs_part_1",
             self.data_dir / "imgs_part_2",
@@ -233,7 +232,7 @@ class SkinCancerDataset(Dataset):
         
         # Target
         diagnostic = row['diagnostic']
-        target = self.diagnosis_to_id.get(diagnostic, 1)
+        target = self.diagnosis_to_id[diagnostic]
         data['target'] = torch.tensor(target, dtype=torch.long)
         
         return data
