@@ -10,6 +10,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Tuple
 
@@ -20,6 +22,8 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from sklearn.decomposition import PCA
 from sklearn.random_projection import GaussianRandomProjection
 from tabicl import TabICLClassifier
+from tabpfn import TabPFNClassifier
+from tabpfn.constants import ModelVersion
 
 from baseline_heads import LinearProbe, MLPHead, train_head, predict_head
 
@@ -77,6 +81,7 @@ def run_single_seed(
     n_estimators: int,
     pca_dims: int | None,
     rp_dims: int | None,
+    train_size: int | None = None,
 ) -> dict:
     """Run a single training/evaluation with a specific seed.
     
@@ -86,11 +91,12 @@ def run_single_seed(
         y: Labels.
         seed: Random seed for this run.
         test_size: Validation set fraction.
-        classifier: Type of classifier ("tabicl", "logistic_regression", or "mlp").
+        classifier: Type of classifier ("tabicl", "tabpfn", "logistic_regression", or "mlp").
         modality: Which features to use ("tabular", "image", or "concat").
-        n_estimators: Number of TabICL estimators.
+        n_estimators: Number of estimators.
         pca_dims: PCA dimensions (None to skip).
         rp_dims: Random projection dimensions (None to skip).
+        train_size: Number of training samples to use (None to use all).
     
     Returns:
         Dictionary with metrics for each modality.
@@ -104,6 +110,14 @@ def run_single_seed(
         random_state=seed,
         stratify=y,
     )
+    
+    # Subset training data if train_size is specified
+    if train_size is not None and train_size < len(X_train_img):
+        rng = np.random.RandomState(seed)
+        train_indices = rng.choice(len(X_train_img), size=train_size, replace=False)
+        X_train_img = X_train_img[train_indices]
+        X_train_tab = X_train_tab[train_indices]
+        y_train = y_train[train_indices]
 
     # Apply PCA to image features if requested
     if pca_dims is not None:
@@ -120,59 +134,16 @@ def run_single_seed(
     results = {}
     
     if modality in ("tabular", "concat"):
-        # For tabular modality with logistic_regression/mlp, need to extract ICL features first
-        if modality == "tabular" and classifier in ("logistic_regression", "mlp"):
-            if classifier == "logistic_regression":
-                probe = LogisticRegression(max_iter=1000, random_state=seed, multi_class='ovr')
-            else:  # mlp
-                probe = MLPClassifier(
-                    hidden_layer_sizes=(256,),
-                    max_iter=1000,
-                    random_state=seed,
-                    early_stopping=True,
-                    validation_fraction=0.1,
-                )
-            
-            # Train TabICL to extract features
-            tabicl_clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
-            X_train_tab_32 = np.asarray(X_train_tab, dtype=np.float32)
-            X_val_tab_32 = np.asarray(X_val_tab, dtype=np.float32)
-            tabicl_clf.fit(X_train_tab_32, y_train)
-            
-            # Extract ICL features
-            train_icl_feats = tabicl_clf.get_icl_features(X_train_tab_32)
-            val_icl_feats = tabicl_clf.get_icl_features(X_val_tab_32)
-            
-            # Train probe on ICL features
-            probe.fit(train_icl_feats, y_train)
-            y_pred = probe.predict(val_icl_feats)
-            y_pred_proba = probe.predict_proba(val_icl_feats)
-            
-            # Compute metrics
-            metrics = {
-                "accuracy": accuracy_score(y_val, y_pred),
-                "precision": precision_score(y_val, y_pred, average="weighted", zero_division=0),
-                "recall": recall_score(y_val, y_pred, average="weighted", zero_division=0),
-                "f1": f1_score(y_val, y_pred, average="weighted", zero_division=0),
-            }
-            try:
-                metrics["auroc"] = roc_auc_score(y_val, y_pred_proba, multi_class="ovr", average="weighted")
-            except Exception:
-                metrics["auroc"] = None
-            
-            results["tabular"] = metrics
-        
-        elif modality == "tabular" and classifier == "tabicl":
-            results["tabular"] = train_and_evaluate(
-                X_train=X_train_tab,
-                X_val=X_val_tab,
-                y_train=y_train,
-                y_val=y_val,
-                classifier=classifier,
-                n_estimators=n_estimators,
-                random_state=seed,
-                verbose=False,
-            )
+        results["tabular"] = train_and_evaluate(
+            X_train=X_train_tab,
+            X_val=X_val_tab,
+            y_train=y_train,
+            y_val=y_val,
+            classifier=classifier,
+            n_estimators=n_estimators,
+            random_state=seed,
+            verbose=False,
+        )
     
     if modality in ("image", "concat"):
         results["image"] = train_and_evaluate(
@@ -212,6 +183,7 @@ def train_and_evaluate(
     n_estimators: int = 1,
     random_state: int = 42,
     verbose: bool = True,
+    tabular_model: str = "tabicl",
 ) -> dict:
     """Train classifier and evaluate on validation set.
 
@@ -220,8 +192,8 @@ def train_and_evaluate(
         X_val: Validation features.
         y_train: Training targets.
         y_val: Validation targets.
-        classifier: Type of classifier ("tabicl", "logistic_regression", or "mlp").
-        n_estimators: Number of estimators for TabICL (ignored for other classifiers).
+        classifier: Type of classifier ("tabicl", "tabpfn", "logistic_regression", or "mlp").
+        n_estimators: Number of estimators for TabICL/TabPFN (ignored for other classifiers).
         random_state: Random seed.
         verbose: Whether to print results.
 
@@ -243,6 +215,13 @@ def train_and_evaluate(
         y_pred_proba = clf.predict_proba(X_val)
         y_pred = np.argmax(y_pred_proba, axis=1)
         y_pred = clf.y_encoder_.inverse_transform(y_pred)
+    
+    elif classifier == "tabpfn":
+        clf = TabPFNClassifier(random_state=random_state)
+        #clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2, ignore_pretraining_limits=True)
+        clf.fit(X_train, y_train)
+        y_pred_proba = clf.predict_proba(X_val)
+        y_pred = np.argmax(y_pred_proba, axis=1)
     
     elif classifier == "logistic_regression":
         # Linear probe using PyTorch
@@ -411,6 +390,45 @@ def train_icl_fusion(
     return metrics
 
 
+def save_results(
+    all_results: dict,
+    config: dict,
+    output_dir: Path | str = "results",
+) -> Path:
+    """Save results and configuration to a JSON file.
+    
+    Args:
+        all_results: Dictionary containing results organized by train_size and modality.
+        config: Dictionary with all configuration parameters.
+        output_dir: Directory to save results to.
+    
+    Returns:
+        Path to the saved results file.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset = config.get("dataset", "unknown")
+    classifier = config.get("classifier", "unknown")
+    filename = f"{dataset}_{classifier}_{timestamp}.json"
+    filepath = output_dir / filename
+    
+    # Prepare data to save
+    save_data = {
+        "config": config,
+        "results": all_results,
+    }
+    
+    # Save to JSON (convert numpy types to Python types for JSON serialization)
+    with open(filepath, "w") as f:
+        json.dump(save_data, f, indent=2, default=str)
+    
+    print(f"\nResults saved to: {filepath}")
+    return filepath
+
+
 def main(
     features_path: Path | str = "extracted_features/petfinder_dinov3_features.pt",
     dataset: str = "petfinder",
@@ -421,6 +439,8 @@ def main(
     n_estimators: int = 1,
     pca_dims: int | None = None,
     rp_dims: int | None = None,
+    train_sizes: list[int] | None = None,
+    save_results_flag: bool = True,
 ) -> None:
     """Main script: load data, split, train, and evaluate on any dataset.
 
@@ -429,11 +449,13 @@ def main(
         dataset: Dataset name (petfinder, covid19, skin-cancer, paintings).
         test_size: Fraction of data to use for validation.
         num_seeds: Number of random seeds to run.
-        classifier: Classifier to use ("tabicl", "logistic_regression", or "mlp").
+        classifier: Classifier to use ("tabicl", "tabpfn", "logistic_regression", or "mlp").
         modality: Which features to use ("tabular", "image", or "concat").
-        n_estimators: Number of estimators for TabICL (ignored for other classifiers).
+        n_estimators: Number of estimators for TabICL/TabPFN (ignored for other classifiers).
         pca_dims: Number of PCA components to reduce image features to (None to skip PCA).
         rp_dims: Number of random projection dimensions for image features (None to skip RP).
+        train_sizes: List of training set sizes to evaluate (e.g., [10, 100, 1000]). If None, uses all training data.
+        save_results_flag: Whether to save results to a JSON file.
     """
     print("=" * 70)
     print(f"Multimodal Learning on {dataset.upper()} Dataset (Multi-Seed Evaluation)")
@@ -445,72 +467,109 @@ def main(
     print("\nLoading features...")
     X_img, X_tab, y = load_features(features_path=features_path, dataset=dataset)
     
-    print(f"\nRunning {num_seeds} seeds...")
+    # If no train_sizes specified, use all training data (None)
+    if train_sizes is None:
+        train_sizes = [None]
+    
+    print(f"\nRunning {num_seeds} seeds for {len(train_sizes)} training set size(s)...")
     print(f"Validation set size: {test_size*100:.0f}%")
+    print(f"Training set size(s): {train_sizes}")
     if pca_dims is not None:
         print(f"Image PCA dimensions: {pca_dims}")
     if rp_dims is not None:
         print(f"Image random projection dimensions: {rp_dims}")
     
-    # Collect results from all seeds
-    all_results = {
-        "tabular": [],
-        "image": [],
-        "concat": [],
-    }
+    # Store all results organized by train_size
+    all_results_by_train_size = {}
     
-    for seed in range(num_seeds):
-        print(f"\n[Seed {seed}]")
-        results = run_single_seed(
-            X_img=X_img,
-            X_tab=X_tab,
-            y=y,
-            seed=seed,
-            test_size=test_size,
-            classifier=classifier,
-            modality=modality,
-            n_estimators=n_estimators,
-            pca_dims=pca_dims,
-            rp_dims=rp_dims,
-        )
-        
-        for mod_name, metrics in results.items():
-            all_results[mod_name].append(metrics)
-    
-    # Compute and display statistics
-    print("\n" + "=" * 70)
-    print("AGGREGATED RESULTS (Mean ± Std over all seeds)")
-    print("=" * 70)
-    
-    metric_names = ["accuracy", "precision", "recall", "f1", "auroc"]
-    
-    if modality in ("tabular", "both"):
-        print("\n" + "-" * 70)
-        print("TABULAR-ONLY FEATURES")
-        print("-" * 70)
-        _print_metric_stats(all_results["tabular"], metric_names)
-    
-    if modality in ("image", "both"):
-        print("\n" + "-" * 70)
-        print("IMAGE-ONLY FEATURES (DinoV3)")
-        print("-" * 70)
-        _print_metric_stats(all_results["image"], metric_names)
-    
-    if modality == "concat":
-        print("\n" + "-" * 70)
-        print("CONCATENATED FEATURES (Image + Tabular)")
-        print("-" * 70)
-        _print_metric_stats(all_results["concat"], metric_names)
-    
-    if modality == "both":
-        print("\n" + "=" * 70)
-        print("COMPARISON: TABULAR vs IMAGE")
+    # Loop over each training size
+    for train_size in train_sizes:
+        print(f"\n" + "=" * 70)
+        if train_size is None:
+            print("Using ALL training data")
+        else:
+            print(f"Training with {train_size} samples")
         print("=" * 70)
-        _print_comparison(all_results["tabular"], all_results["image"], metric_names)
+        
+        # Collect results from all seeds for this train_size
+        all_results = {
+            "tabular": [],
+            "image": [],
+            "concat": [],
+        }
+        
+        for seed in range(num_seeds):
+            print(f"\n[Seed {seed}]")
+            results = run_single_seed(
+                X_img=X_img,
+                X_tab=X_tab,
+                y=y,
+                seed=seed,
+                test_size=test_size,
+                classifier=classifier,
+                modality=modality,
+                n_estimators=n_estimators,
+                pca_dims=pca_dims,
+                rp_dims=rp_dims,
+                train_size=train_size,
+            )
+            
+            for mod_name, metrics in results.items():
+                all_results[mod_name].append(metrics)
+        
+        # Compute and display statistics for this train_size
+        print("\n" + "=" * 70)
+        print(f"RESULTS FOR TRAIN_SIZE={train_size if train_size else 'ALL'}")
+        print("=" * 70)
+        
+        metric_names = ["accuracy", "precision", "recall", "f1", "auroc"]
+        
+        if modality in ("tabular", "both"):
+            print("\n" + "-" * 70)
+            print("TABULAR-ONLY FEATURES")
+            print("-" * 70)
+            _print_metric_stats(all_results["tabular"], metric_names)
+        
+        if modality in ("image", "both"):
+            print("\n" + "-" * 70)
+            print("IMAGE-ONLY FEATURES (DinoV3)")
+            print("-" * 70)
+            _print_metric_stats(all_results["image"], metric_names)
+        
+        if modality == "concat":
+            print("\n" + "-" * 70)
+            print("CONCATENATED FEATURES (Image + Tabular)")
+            print("-" * 70)
+            _print_metric_stats(all_results["concat"], metric_names)
+        
+        if modality == "both":
+            print("\n" + "=" * 70)
+            print("COMPARISON: TABULAR vs IMAGE")
+            print("=" * 70)
+            _print_comparison(all_results["tabular"], all_results["image"], metric_names)
+        
+        # Store results for this train_size
+        key = str(train_size) if train_size else "all"
+        all_results_by_train_size[key] = all_results
     
     print("\n" + "=" * 70)
     print("Script completed successfully!")
     print("=" * 70)
+    
+    # Save results if requested
+    if save_results_flag:
+        config = {
+            "dataset": dataset,
+            "classifier": classifier,
+            "modality": modality,
+            "train_sizes": train_sizes if train_sizes != [None] else None,
+            "test_size": test_size,
+            "num_seeds": num_seeds,
+            "n_estimators": n_estimators,
+            "pca_dims": pca_dims,
+            "rp_dims": rp_dims,
+        }
+        save_results(all_results_by_train_size, config)
 
 
 def _print_metric_stats(metrics_list: list, metric_names: list) -> None:
@@ -592,7 +651,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classifier",
         type=str,
-        choices=["tabicl", "logistic_regression", "mlp"],
+        choices=["tabicl", "tabpfn", "logistic_regression", "mlp"],
         default="tabicl",
         help="Classifier to use for prediction",
     )
@@ -616,6 +675,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of random projection dimensions for image features (e.g., 128). If not specified, random projection is not applied.",
     )
+    parser.add_argument(
+        "--train-sizes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of training set sizes to evaluate (e.g., --train-sizes 10 100 1000 10000). If not specified, all training data is used.",
+    )
     return parser.parse_args()
 
 
@@ -627,6 +693,9 @@ if __name__ == "__main__":
             args.features_path = Path(f"extracted_features/{args.dataset}_dinov3_features.pt")
     
     #TODO: Currently only works for petfinder, need to debug other datasets.
+    # Convert empty list from nargs="*" to None
+    train_sizes = args.train_sizes if args.train_sizes else None
+    
     main(
         features_path=args.features_path,
             dataset=args.dataset,
@@ -637,4 +706,6 @@ if __name__ == "__main__":
         n_estimators=args.n_estimators,
         pca_dims=args.pca_dims,
         rp_dims=args.rp_dims,
+        train_sizes=train_sizes,
+        save_results_flag=True,
     )
