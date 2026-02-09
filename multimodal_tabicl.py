@@ -119,6 +119,16 @@ def run_single_seed(
         X_train_tab = X_train_tab[train_indices]
         y_train = y_train[train_indices]
 
+    #Limit validation to 1000 samples for faster evaluation (only for larger datasets)
+    if len(X_val_img) > 1000:
+        rng = np.random.RandomState(seed)
+        val_indices = rng.choice(len(X_val_img), size=1000, replace=False)
+        X_val_img = X_val_img[val_indices]
+        X_val_tab = X_val_tab[val_indices]
+        y_val = y_val[val_indices]
+
+    print(f"Training samples: {len(X_train_img)}, Validation samples: {len(X_val_img)}")
+
     # Apply PCA to image features if requested
     if pca_dims is not None:
         pca_img = PCA(n_components=pca_dims, random_state=seed)
@@ -277,10 +287,14 @@ def train_and_evaluate(
 
     # Compute AUROC (handles multi-class with ovr strategy)
     try:
-        metrics["auroc"] = roc_auc_score(y_val, y_pred_proba, multi_class="ovr", average="weighted")
+        if y_pred_proba.shape[1] == 2:
+            # Binary classification case
+            metrics["auroc"] = roc_auc_score(y_val, y_pred_proba[:, 1])
+        else:
+            metrics["auroc"] = roc_auc_score(y_val, y_pred_proba, multi_class="ovr", average="weighted")
     except Exception as e:
-        if verbose:
-            print(f"Warning: Could not compute AUROC - {e}")
+        #if verbose:
+        print(f"Warning: Could not compute AUROC - {e}")
         metrics["auroc"] = None
 
     if verbose:
@@ -393,7 +407,7 @@ def train_icl_fusion(
 def save_results(
     all_results: dict,
     config: dict,
-    output_dir: Path | str = "results",
+    output_dir: Path | str = "results/multimodal_results",
 ) -> Path:
     """Save results and configuration to a JSON file.
     
@@ -470,6 +484,20 @@ def main(
     # If no train_sizes specified, use all training data (None)
     if train_sizes is None:
         train_sizes = [None]
+    
+    # Validate train_sizes against actual training set size
+    max_train_size = int(len(y) * (1 - test_size))
+    if train_sizes != [None]:
+        original_train_sizes = train_sizes.copy()
+        train_sizes = [min(size, max_train_size) for size in train_sizes]
+        
+        # Check if any sizes were adjusted
+        if train_sizes != original_train_sizes:
+            print(f"\nWarning: Some requested train sizes exceed maximum available ({max_train_size}):")
+            for orig, adjusted in zip(original_train_sizes, train_sizes):
+                if orig != adjusted:
+                    print(f"  {orig} -> {adjusted}")
+            print(f"Adjusted train_sizes: {train_sizes}")
     
     print(f"\nRunning {num_seeds} seeds for {len(train_sizes)} training set size(s)...")
     print(f"Validation set size: {test_size*100:.0f}%")

@@ -71,6 +71,10 @@ class PaintingsPricePredictionDataset(Dataset):
     def __len__(self):
         return len(self.df)
     
+    def get_feature_columns(self) -> List[str]:
+        """Return list of feature column names."""
+        return [col for col in self.df.columns if col not in ['image_url', 'price']]
+    
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         
@@ -204,6 +208,11 @@ class SkinCancerDataset(Dataset):
     def __len__(self):
         return len(self.df)
     
+    def get_feature_columns(self) -> List[str]:
+        """Return list of feature column names."""
+        exclude_cols = ['img_id', 'patient_id', 'diagnostic', 'lesion_id']
+        return [col for col in self.df.columns if col not in exclude_cols]
+    
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         
@@ -223,9 +232,7 @@ class SkinCancerDataset(Dataset):
             data['image'] = image
         
         # Tabular features
-        # Get all feature columns except target-related and id columns
-        exclude_cols = ['img_id', 'patient_id', 'diagnostic', 'lesion_id']
-        feature_cols = [col for col in self.df.columns if col not in exclude_cols]
+        feature_cols = self.get_feature_columns()
         
         features = row[feature_cols].values.astype(np.float32)
         data['features'] = torch.tensor(features, dtype=torch.float32)
@@ -285,6 +292,10 @@ class PetFinderDataset(Dataset):
     
     def __len__(self):
         return len(self.df)
+    
+    def get_feature_columns(self) -> List[str]:
+        """Return list of feature column names."""
+        return ['Type', 'Age', 'Gender', 'MaturitySize', 'FurLength', 'Vaccinated', 'Dewormed', 'Sterilized', 'Health']
     
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]

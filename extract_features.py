@@ -154,6 +154,11 @@ def extract_features(
     transform = make_transform(img_size)
     base_dataset = get_dataset(dataset_name, data_dir, split, transform)
     dataset = IndexedDataset(base_dataset, dataset_name)
+    
+    # Extract column names from the dataset if available
+    column_names = None
+    if hasattr(base_dataset, 'get_feature_columns'):
+        column_names = base_dataset.get_feature_columns()
 
     loader = DataLoader(
         dataset,
@@ -206,6 +211,8 @@ def extract_features(
     
     if tabular_features:
         output["tabular_features"] = torch.cat(tabular_features, dim=0)
+        if column_names is not None:
+            output["column_names"] = column_names
     
     if targets_list:
         output["targets"] = torch.cat(targets_list, dim=0)
@@ -217,6 +224,8 @@ def extract_features(
     print(f"Image features shape: {output['image_features'].shape}")
     if "tabular_features" in output:
         print(f"Tabular features shape: {output['tabular_features'].shape}")
+        if "column_names" in output:
+            print(f"Column names: {output['column_names']}")
     if "targets" in output:
         print(f"Targets shape: {output['targets'].shape}")
 
