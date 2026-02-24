@@ -56,6 +56,33 @@ class MLPHead(nn.Module):
         return self.mlp(x)
 
 
+class LinearRegressionHead(nn.Module):
+    """Linear head for scalar regression."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x).squeeze(-1)
+
+
+class MLPRegressionHead(nn.Module):
+    """2-layer MLP head for scalar regression."""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x).squeeze(-1)
+
+
 def train_head(
     model: nn.Module,
     X_train: np.ndarray,
@@ -207,3 +234,92 @@ def predict_head(
         probs = torch.softmax(logits, dim=1).cpu().numpy()
     
     return preds, probs
+
+
+def train_head_regression(
+    model: nn.Module,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    learning_rate: float = 0.001,
+    num_epochs: int = 100,
+    batch_size: int = 32,
+    early_stopping_patience: int = 10,
+    device: str = "cpu",
+    verbose: bool = False,
+) -> tuple:
+    """Train a regression head (linear or MLP) with MSE loss."""
+    model = model.to(device)
+
+    X_train_tensor = torch.from_numpy(X_train.astype(np.float32)).to(device)
+    y_train_tensor = torch.from_numpy(y_train.astype(np.float32)).to(device)
+    X_val_tensor = torch.from_numpy(X_val.astype(np.float32)).to(device)
+    y_val_tensor = torch.from_numpy(y_val.astype(np.float32)).to(device)
+
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    best_val_loss = np.inf
+    best_model_state = None
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            preds = model(X_batch)
+            loss = criterion(preds, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        with torch.no_grad():
+            val_preds = model(X_val_tensor)
+            val_loss = criterion(val_preds, y_val_tensor)
+
+        if verbose and (epoch + 1) % 10 == 0:
+            print(
+                f"Epoch {epoch + 1}/{num_epochs} - "
+                f"Train Loss: {train_loss / len(train_loader):.4f}, "
+                f"Val Loss: {val_loss.item():.4f}"
+            )
+
+        if val_loss.item() < best_val_loss:
+            best_val_loss = val_loss.item()
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stopping_patience:
+                if verbose:
+                    print(
+                        f"Early stopping at epoch {epoch + 1} "
+                        f"(no validation loss improvement for {early_stopping_patience} epochs)"
+                    )
+                break
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model, {"mse": float(best_val_loss)}
+
+
+def predict_head_regression(
+    model: nn.Module,
+    X: np.ndarray,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Predict scalar regression targets using a trained head."""
+    model.eval()
+    X_tensor = torch.from_numpy(X.astype(np.float32)).to(device)
+
+    with torch.no_grad():
+        preds = model(X_tensor).cpu().numpy()
+
+    return np.asarray(preds, dtype=np.float32)

@@ -469,7 +469,7 @@ if __name__ == "__main__":
         print(f"   Image shape: {batch['image'].shape}")
     print(f"   Features shape: {batch['features'].shape}")
     print(f"   Target shape: {batch['target'].shape}\n")
-    
+
     # COVID-19 dataset
     print("2. COVID-19 Chest X-ray Dataset")
     covid_dl = get_dataloader('covid19', batch_size=4)

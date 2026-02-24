@@ -1,14 +1,23 @@
-# DVM Experiments — Script Guide
+# Experiments — Script Guide
 
-`dvm_experiments.py` benchmarks classification models on the **DVM car dataset**
-using tabular features, DINOv2 image embeddings, or a concatenation of both.  It
-supports three broad modes of operation:
+`experiments.py` benchmarks classification models on tabular + image-embedding
+datasets using tabular features, DINOv2/v3 image embeddings, or a concatenation
+of both.  It supports multiple datasets and three broad modes of operation:
 
 | Mode | What it does |
 |---|---|
 | **Standard** | Runs TabICL, Decision Tree, Random Forest, and XGBoost on the chosen feature set. |
 | **Feature suite** (`--feature-suite`) | Sweeps all 9 combinations of feature mode × image reducer in a single run. |
 | **Probing** (`--tabicl-features-dir` or `--methods linear_probe mlp`) | Replaces raw tabular features with pre-extracted TabICL representations and trains lightweight PyTorch heads. |
+
+### Supported datasets
+
+| `--dataset` | Description | Loader module |
+|---|---|---|
+| `dvm` *(default)* | DVM car dataset — 768-d DINOv2 embeddings, 10 tabular features | `dvm_dataset_with_dinov2.py` |
+| `petfinder` | PetFinder adoption prediction — 768-d DINOv3 embeddings, 9 tabular features | `petfinder_dataset_with_dinov3.py` |
+
+All dataset loaders return the same 4-tuple `(train_loader, val_loader, test_loader, metadata)` and per-sample dicts with keys `tabular`, `image_embedding`, and `target`.  Adding a new dataset requires one entry in `DATASET_CONFIGS` and, if the loader signature differs, a small dispatch block in `_load_data()`.
 
 ---
 
@@ -28,23 +37,33 @@ supports three broad modes of operation:
 ## Quick Start
 
 ```bash
-# Standard run – tabular only, all four models, 20 k train rows
-python dvm_experiments.py
+# DVM — standard run, tabular only, all four models, 20 k train rows
+python experiments.py
 
-# Image-only features with PCA-128 reduction, XGBoost only
-python dvm_experiments.py \
+# DVM — image-only features with PCA-128 reduction, XGBoost only
+python experiments.py \
     --feature-mode image --image-reducer pca --image-reducer-dim 128 \
     --methods xgboost
 
-# Full 9-config feature comparison suite
-python dvm_experiments.py --feature-suite --suite-reducer-dim 64
+# DVM — full 9-config feature comparison suite
+python experiments.py --feature-suite --suite-reducer-dim 64
 
-# Probing mode with pre-extracted TabICL features
-python dvm_experiments.py --methods linear_probe mlp
+# DVM — probing mode with pre-extracted TabICL features
+python experiments.py --methods linear_probe mlp
 
-# Probing + image concat suite
-python dvm_experiments.py \
-    --methods linear_probe mlp --feature-suite \
+# PetFinder — standard run, tabular only
+python experiments.py --dataset petfinder
+
+# PetFinder — image concat, Random Forest + XGBoost
+python experiments.py --dataset petfinder \
+    --feature-mode concat --methods random_forest xgboost
+
+# PetFinder — full feature suite
+python experiments.py --dataset petfinder --feature-suite
+
+# Probing + image concat suite (any dataset)
+python experiments.py \
+    --dataset dvm --methods linear_probe mlp --feature-suite \
     --tabicl-features-dir /path/to/tabiclv2_features
 ```
 
@@ -57,7 +76,7 @@ concern.  Helper functions are prefixed with `_` and documented in-line.
 
 | # | Section | Key functions |
 |---|---------|---------------|
-| 1 | **Data loading** | `_import_load_dvm_dataset`, `_extract_modalities_from_dataset`, `_load_data` |
+| 1 | **Data loading** | `_import_dataset_loader`, `_extract_modalities_from_dataset`, `_load_data` |
 | 2 | **Sampling** | `_stratified_indices`, `_maybe_index` |
 | 3 | **TabICL representations** | `_load_representations`, `_load_all_representations` |
 | 4 | **Image reduction** | `_fit_image_reducer`, `_apply_reducer` |
@@ -68,13 +87,37 @@ concern.  Helper functions are prefixed with `_` and documented in-line.
 | 9 | **Main loop** | `run_experiment` |
 | 10 | **CLI** | `parse_args`, `main` |
 
+### Dataset registry
+
+`DATASET_CONFIGS` is a dict mapping dataset names to their configuration:
+
+```python
+DATASET_CONFIGS = {
+    "dvm": {
+        "module_path": Path("…/dvm_dataset_with_dinov2.py"),
+        "loader_fn":   "load_dvm_dataset",
+        "data_dir":    Path("…/DVM_Dataset"),
+        "tabicl_features_dir": Path("…/DVM_Dataset/tabiclv2_features"),
+    },
+    "petfinder": {
+        "module_path": Path("…/petfinder_dataset_with_dinov3.py"),
+        "loader_fn":   "load_petfinder_dataset",
+        "data_dir":    Path("…/petfinder"),
+        "tabicl_features_dir": Path("…/petfinder/tabiclv2_features"),
+    },
+}
+```
+
+To add a new dataset, add an entry here and (if needed) a dispatch branch in
+`_load_data()`.
+
 ### Data flow
 
 ```
-CLI args
+CLI args  (--dataset, --data-dir, --module-path, …)
   │
   ▼
-_load_data()          ──  load DVM splits as numpy arrays
+_load_data()          ──  dispatch to the correct loader, return numpy arrays
   │
   ├─ (optional) _load_all_representations()   ──  pre-extracted TabICL features
   │
@@ -102,14 +145,23 @@ results JSON  →  saved to --results-path
 
 ## CLI Reference
 
-### Paths
+### Dataset selection
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-dir` | `…/DVM_Dataset` | Root of the DVM dataset |
-| `--dvm-module-path` | `…/dvm_dataset_with_dinov2.py` | Path to the Python module that defines `load_dvm_dataset` |
-| `--results-path` | `results/dvm_experiments_results.json` | Where to save the JSON results |
-| `--tabicl-features-dir` | *(auto-resolved)* | Directory with `{split}_representations.pt` files.  Setting this enables probing mode. |
+| `--dataset` | `dvm` | Dataset to evaluate.  Choices: `dvm`, `petfinder`. |
+
+### Paths
+
+All path flags default to per-dataset values from `DATASET_CONFIGS` when not
+explicitly provided.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir` | *(per-dataset)* | Root data directory |
+| `--module-path` | *(per-dataset)* | Path to the Python module that defines the dataset loader (legacy alias: `--dvm-module-path`) |
+| `--results-path` | `results/<dataset>_experiments_results.json` | Where to save the JSON results |
+| `--tabicl-features-dir` | *(auto-resolved per-dataset)* | Directory with `{split}_representations.pt` files.  Setting this enables probing mode. |
 
 ### Seed & sizing
 
@@ -152,7 +204,7 @@ results JSON  →  saved to --results-path
 **Feature modes** control *which* columns are fed to the models:
 
 - `tabular` — only the preprocessed tabular columns (or TabICL representations in probing mode).
-- `image` — only the DINOv2 image embeddings (768-d by default).
+- `image` — only the image embeddings (768-d by default for both DINOv2 and DINOv3).
 - `concat` — column-wise concatenation of tabular + image.
 
 **Image reducers** optionally compress/transform the 768-d image embeddings
@@ -196,7 +248,7 @@ Results for every config × train size × model are collected into a single JSON
 ## Probing Mode
 
 Probing mode is activated when `--tabicl-features-dir` is set (or auto-resolved
-from the default when `--methods` contains `linear_probe` or `mlp`).
+from the per-dataset default when `--methods` contains `linear_probe` or `mlp`).
 
 In this mode:
 
@@ -237,6 +289,7 @@ Results are saved as JSON with this structure:
 ```jsonc
 {
   "metadata": {
+    "dataset": "dvm",
     "data_root": "...",
     "seed": 0,
     "device": "auto",
@@ -282,5 +335,5 @@ Results are saved as JSON with this structure:
 | Script | Purpose |
 |---|---|
 | `extract_tabicl_features.py` | Pre-extract TabICL row representations for probing mode |
-| `dvm_plots.py` | Generate accuracy / F1 plots from the JSON results |
+| `plotting_scripts/dvm_plots.py` | Generate accuracy / F1 plots from the JSON results |
 | `baseline_heads.py` | PyTorch `LinearProbe` / `MLPHead` + `train_head` / `predict_head` |
