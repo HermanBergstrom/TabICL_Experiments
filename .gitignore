@@ -12,6 +12,9 @@ token.sh
 extracted_features/
 model_weights/
 results/
+tab_icl_v2_env
+datasets.zip
+extracted_features.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -82,6 +82,7 @@ def run_single_seed(
     pca_dims: int | None,
     rp_dims: int | None,
     train_size: int | None = None,
+    verbose: bool = True,
 ) -> dict:
     """Run a single training/evaluation with a specific seed.
     
@@ -97,6 +98,7 @@ def run_single_seed(
         pca_dims: PCA dimensions (None to skip).
         rp_dims: Random projection dimensions (None to skip).
         train_size: Number of training samples to use (None to use all).
+        verbose: Whether to print progress and results.
     
     Returns:
         Dictionary with metrics for each modality.
@@ -152,7 +154,7 @@ def run_single_seed(
             classifier=classifier,
             n_estimators=n_estimators,
             random_state=seed,
-            verbose=False,
+            verbose=verbose,
         )
     
     if modality in ("image", "concat"):
@@ -164,7 +166,7 @@ def run_single_seed(
             classifier=classifier,
             n_estimators=n_estimators,
             random_state=seed,
-            verbose=False,
+            verbose=verbose,
         )
 
     if modality == "concat":
@@ -178,7 +180,7 @@ def run_single_seed(
             classifier=classifier,
             n_estimators=n_estimators,
             random_state=seed,
-            verbose=False,
+            verbose=verbose,
         )
     
     return results
@@ -243,7 +245,7 @@ def train_and_evaluate(
             X_val=X_val,
             y_val=y_val,
             num_classes=num_classes,
-            learning_rate=0.001,
+            learning_rate=1e-3,
             num_epochs=100,
             batch_size=32,
             early_stopping_patience=10,
@@ -262,7 +264,7 @@ def train_and_evaluate(
             X_val=X_val,
             y_val=y_val,
             num_classes=num_classes,
-            learning_rate=0.001,
+            learning_rate=1e-4,
             num_epochs=100,
             batch_size=32,
             early_stopping_patience=10,
@@ -455,6 +457,7 @@ def main(
     rp_dims: int | None = None,
     train_sizes: list[int] | None = None,
     save_results_flag: bool = True,
+    verbose: bool = True,
 ) -> None:
     """Main script: load data, split, train, and evaluate on any dataset.
 
@@ -470,6 +473,7 @@ def main(
         rp_dims: Number of random projection dimensions for image features (None to skip RP).
         train_sizes: List of training set sizes to evaluate (e.g., [10, 100, 1000]). If None, uses all training data.
         save_results_flag: Whether to save results to a JSON file.
+        verbose: Whether to print progress and results.
     """
     print("=" * 70)
     print(f"Multimodal Learning on {dataset.upper()} Dataset (Multi-Seed Evaluation)")
@@ -540,6 +544,7 @@ def main(
                 pca_dims=pca_dims,
                 rp_dims=rp_dims,
                 train_size=train_size,
+                verbose=verbose,
             )
             
             for mod_name, metrics in results.items():
@@ -710,6 +715,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="List of training set sizes to evaluate (e.g., --train-sizes 10 100 1000 10000). If not specified, all training data is used.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Whether to print progress and results.",
+    )
+    
     return parser.parse_args()
 
 
@@ -736,4 +747,5 @@ if __name__ == "__main__":
         rp_dims=args.rp_dims,
         train_sizes=train_sizes,
         save_results_flag=True,
+        verbose=args.verbose,
     )

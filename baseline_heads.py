@@ -72,6 +72,7 @@ def train_head(
 ) -> tuple:
     """
     Train a classification head (linear probe or MLP).
+    Saves the model with the lowest validation loss.
     
     Args:
         model: PyTorch module to train.
@@ -83,14 +84,13 @@ def train_head(
         learning_rate: Learning rate for optimizer.
         num_epochs: Maximum number of epochs.
         batch_size: Batch size for training.
-        early_stopping_patience: Patience for early stopping.
+        early_stopping_patience: Patience for early stopping (based on validation loss).
         device: Device to use ("cpu" or "cuda").
         verbose: Whether to print training progress.
     
     Returns:
         Tuple of (model, best_metrics)
     """
-    
     # Move model to device
     model = model.to(device)
     
@@ -108,7 +108,7 @@ def train_head(
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
     
-    best_val_f1 = -np.inf
+    best_val_loss = np.inf
     best_model_state = None
     patience_counter = 0
     
@@ -143,16 +143,16 @@ def train_head(
                   f"Val Acc: {val_accuracy:.4f}, "
                   f"Val F1: {val_f1:.4f}")
         
-        # Early stopping
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        # Save model with lowest validation loss
+        if val_loss.item() < best_val_loss:
+            best_val_loss = val_loss.item()
             best_model_state = model.state_dict().copy()
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= early_stopping_patience:
                 if verbose:
-                    print(f"Early stopping at epoch {epoch + 1}")
+                    print(f"Early stopping at epoch {epoch + 1} (no validation loss improvement for {early_stopping_patience} epochs)")
                 break
     
     # Load best model
