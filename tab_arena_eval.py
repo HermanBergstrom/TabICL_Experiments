@@ -154,7 +154,8 @@ if __name__ == "__main__":
 
         print(f"TabArena Repeats: {tabarena_repeats} | Folds: {folds}")
         
-        methods = ['tab_icl', 'tab_pfn']
+        #methods = ['tab_icl', 'tab_pfn']
+        methods = ['tab_icl']
 
         # Initialize results_dict with structure for all n_samples values
         results_dict = {

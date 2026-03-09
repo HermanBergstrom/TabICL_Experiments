@@ -93,6 +93,7 @@ DATASET_NAMES = list(DATASET_CONFIGS.keys())
 STANDARD_METHODS = ["tabicl", "decision_tree", "random_forest", "xgboost"]
 PROBING_METHODS = ["linear_probe", "mlp"]
 ALL_METHODS = STANDARD_METHODS + PROBING_METHODS
+DIM_AUGMENTERS = ["none", "random_projection", "gaussian_append"]
 
 
 # ===================================================================
@@ -419,6 +420,49 @@ def _build_features(
 	raise ValueError(f"Unknown feature_mode: {mode}")
 
 
+def _apply_dimensionality_augmentation(
+	X_train: np.ndarray,
+	X_val: np.ndarray,
+	X_test: np.ndarray,
+	augmenter: str,
+	target_dim: int | None,
+	seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, object | None]:
+	"""Increase feature dimensionality using random projection or Gaussian append.
+
+	When *augmenter* is ``'none'``, this is a pass-through.
+	"""
+	if augmenter == "none":
+		return X_train, X_val, X_test, None
+
+	input_dim = int(X_train.shape[1])
+	if target_dim is None:
+		raise ValueError("--dim-augment-dim is required when --dim-augmenter is enabled")
+	if target_dim <= input_dim:
+		raise ValueError(
+			f"--dim-augment-dim must be > input dim ({input_dim}) when using --dim-augmenter={augmenter}."
+		)
+
+	if augmenter == "random_projection":
+		rp = GaussianRandomProjection(n_components=target_dim, random_state=seed)
+		return rp.fit_transform(X_train), rp.transform(X_val), rp.transform(X_test), rp
+
+	if augmenter == "gaussian_append":
+		extra_dim = target_dim - input_dim
+
+		def _append_noise(X: np.ndarray, rng_seed: int) -> np.ndarray:
+			rng = np.random.default_rng(rng_seed)
+			noise = rng.standard_normal((X.shape[0], extra_dim)).astype(np.float32)
+			return np.concatenate([X, noise], axis=1)
+
+		X_train_aug = _append_noise(X_train, seed)
+		X_val_aug = _append_noise(X_val, seed + 1)
+		X_test_aug = _append_noise(X_test, seed + 2)
+		return X_train_aug, X_val_aug, X_test_aug, {"extra_dim": extra_dim}
+
+	raise ValueError(f"Unknown dim augmenter: {augmenter}")
+
+
 # ===================================================================
 # 6. Feature experiment configs
 # ===================================================================
@@ -691,6 +735,8 @@ def run_experiment(
 	xgb_progress: bool,
 	xgb_verbose_every: int,
 	device: str,
+	dim_augmenter: str,
+	dim_augment_dim: int | None,
 	tabicl_features_dir: Path | None = None,
 ) -> None:
 	# --- Data loading ------------------------------------------------
@@ -760,6 +806,8 @@ def run_experiment(
 		print(f"  tabular    : {X_tab_full['train'].shape}  task=regression")
 	if X_img_full["train"] is not None:
 		print(f"  image      : {X_img_full['train'].shape}")
+	if dim_augmenter != "none":
+		print(f"  dim_aug    : {dim_augmenter} -> target_dim={dim_augment_dim}")
 	print(f"  methods    : {selected_methods}")
 	print(f"  train sizes: {train_sizes_to_run}\n")
 
@@ -769,6 +817,8 @@ def run_experiment(
 			"dataset": dataset, "data_root": str(data_root),
 			"task": task,
 			"seed": seed, "device": device,
+			"dim_augmenter": dim_augmenter,
+			"dim_augment_dim": dim_augment_dim,
 			"probing_mode": probing_mode,
 			"feature_suite": feature_suite, "feature_experiments": feature_experiments,
 			"train_sizes": train_sizes_to_run, "methods": selected_methods,
@@ -822,7 +872,7 @@ def run_experiment(
 				f"train_size={label} #####"
 			)
 
-			feature_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, object | None]] = {}
+			feature_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, object | None, object | None]] = {}
 
 			def _features_for_method(model_name: str):
 				cache_key = "probing" if model_name in PROBING_METHODS else "standard"
@@ -843,7 +893,15 @@ def run_experiment(
 					seed=seed,
 					X_rep=(X_rep_train, X_rep_val, X_rep_test) if use_reps else (None, None, None),
 				)
-				feature_cache[cache_key] = (X_train_f, X_val_f, X_test_f, fitted_reducer)
+				X_train_f, X_val_f, X_test_f, fitted_augmenter = _apply_dimensionality_augmentation(
+					X_train_f,
+					X_val_f,
+					X_test_f,
+					augmenter=dim_augmenter,
+					target_dim=dim_augment_dim,
+					seed=seed,
+				)
+				feature_cache[cache_key] = (X_train_f, X_val_f, X_test_f, fitted_reducer, fitted_augmenter)
 				return feature_cache[cache_key]
 
 			std_models = _build_standard_models(task, seed, n_estimators, xgb_progress, xgb_verbose_every)
@@ -855,7 +913,7 @@ def run_experiment(
 			}
 
 			for model_name in selected_methods:
-				X_train_f, X_val_f, X_test_f, fitted_reducer = _features_for_method(model_name)
+				X_train_f, X_val_f, X_test_f, fitted_reducer, fitted_augmenter = _features_for_method(model_name)
 				feature_source = (
 					"tabicl_representations"
 					if model_name in PROBING_METHODS and probing_reps_supported
@@ -864,6 +922,11 @@ def run_experiment(
 				print(f"[info] {model_name} feature_source: {feature_source} | dim={X_train_f.shape[1]}")
 				if fitted_reducer is not None:
 					print(f"[info] Reducer: {cfg_reducer} (dim={getattr(fitted_reducer, 'n_components', '?')})")
+				if fitted_augmenter is not None:
+					if dim_augmenter == "gaussian_append":
+						print(f"[info] Dim augmenter: gaussian_append (+{fitted_augmenter['extra_dim']})")
+					else:
+						print(f"[info] Dim augmenter: {dim_augmenter} (target_dim={dim_augment_dim})")
 
 				# -- Probing heads --
 				if model_name in PROBING_METHODS:
@@ -970,6 +1033,10 @@ def parse_args() -> argparse.Namespace:
 
 	# Device
 	p.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+	p.add_argument("--dim-augmenter", type=str, choices=DIM_AUGMENTERS, default="none",
+		help="Optional post-assembly dimensionality increase method")
+	p.add_argument("--dim-augment-dim", type=int, default=None,
+		help="Target feature dimension after --dim-augmenter (must be > input dim)")
 
 	return p.parse_args()
 
@@ -1021,6 +1088,8 @@ def main() -> None:
 			xgb_progress=args.xgb_progress,
 			xgb_verbose_every=args.xgb_verbose_every,
 			device=args.device,
+			dim_augmenter=args.dim_augmenter,
+			dim_augment_dim=args.dim_augment_dim,
 			tabicl_features_dir=args.tabicl_features_dir,
 		)
 
