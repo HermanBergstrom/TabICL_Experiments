@@ -15,6 +15,7 @@ results/
 tab_icl_v2_env
 datasets.zip
 extracted_features.zip
+multimodal-embeddings-489820-03efef353fa6.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -43,6 +44,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+checkpoint*
+*.pth.tar
 
 # PyInstaller
 #   Usually these files are written by a python script from a template

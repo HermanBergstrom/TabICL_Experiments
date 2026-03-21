@@ -1,10 +1,11 @@
 """Multi-dataset experiment runner.
 
-Benchmarks classification models on tabular + image-embedding datasets (DVM cars,
-PetFinder adoption, etc.) using tabular features, DINOv2/v3 image embeddings, or
-their concatenation.  Supports optional dimensionality reduction (PCA / ICA /
-random projection) on image features and a "probing mode" that evaluates
-LinearProbe / MLP heads on pre-extracted TabICL representations.
+Benchmarks classification models on tabular + embedding datasets (DVM cars,
+PetFinder adoption, etc.) using tabular features, image embeddings, text
+embeddings, or supported concatenations. Supports optional dimensionality
+reduction (PCA / ICA / random projection) on embedding features and a
+"probing mode" that evaluates LinearProbe / MLP heads on pre-extracted
+TabICL representations.
 
 See DVM_EXPERIMENTS.md for a full walkthrough.
 """
@@ -21,11 +22,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.decomposition import FastICA, PCA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score
+from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.random_projection import GaussianRandomProjection
 from sklearn.tree import DecisionTreeRegressor
@@ -33,6 +35,7 @@ from sklearn.tree import DecisionTreeClassifier
 from tabicl import TabICLClassifier, TabICLRegressor
 from tqdm import tqdm
 from xgboost import XGBClassifier, XGBRegressor
+from skrub import TableVectorizer
 
 from baseline_heads import (
 	LinearProbe,
@@ -86,6 +89,18 @@ DATASET_CONFIGS: dict[str, dict] = {
 			"/home/hermanb/projects/aip-rahulgk/image_icl_project/paintings/tabiclv2_features"
 		),
 	},
+	"mimic": {
+		"module_path": Path(
+			"/home/hermanb/projects/aip-rahulgk/image_icl_project/mimic_loader/mimic_dataset.py"
+		),
+		"loader_fn": "load_mimic_dataset",
+		"data_dir": Path(
+			"/project/aip-rahulgk/hermanb/datasets/mimic-iv"
+		),
+		"tabicl_features_dir": Path(
+			"/home/hermanb/projects/aip-rahulgk/image_icl_project/mimic_loader/tabiclv2_features"
+		),
+	},
 }
 
 DATASET_NAMES = list(DATASET_CONFIGS.keys())
@@ -122,8 +137,8 @@ def _import_dataset_loader(module_path: Path, loader_fn: str):
 
 
 def _extract_modalities_from_dataset(dataset, task: str):
-	"""Walk *dataset* and return ``(X_tab, X_img | None, y)`` as numpy arrays."""
-	tabular_features, image_features, targets = [], [], []
+	"""Walk *dataset* and return ``(X_tab, X_img | None, X_text | None, y)``."""
+	tabular_features, image_features, text_features, targets = [], [], [], []
 
 	for index in tqdm(range(len(dataset))):
 		item = dataset[index]
@@ -132,8 +147,10 @@ def _extract_modalities_from_dataset(dataset, task: str):
 			raise ValueError("Dataset item is missing tabular features")
 
 		tabular_features.append(np.asarray(tabular, dtype=np.float32))
-		emb = item.get("image_embedding")
-		image_features.append(None if emb is None else np.asarray(emb, dtype=np.float32))
+		img_emb = item.get("image_embedding")
+		text_emb = item.get("text_embedding")
+		image_features.append(None if img_emb is None else np.asarray(img_emb, dtype=np.float32))
+		text_features.append(None if text_emb is None else np.asarray(text_emb, dtype=np.float32))
 		if task == "regression":
 			targets.append(float(item["target"]))
 		else:
@@ -141,19 +158,61 @@ def _extract_modalities_from_dataset(dataset, task: str):
 
 	X_tab = np.stack(tabular_features)
 	X_img = None if any(f is None for f in image_features) else np.stack(image_features)
+	X_text = None if any(f is None for f in text_features) else np.stack(text_features)
 	y_dtype = np.float32 if task == "regression" else np.int64
 	y = np.asarray(targets, dtype=y_dtype)
-	return X_tab, X_img, y
+	return X_tab, X_img, X_text, y
+
+
+def _to_dense_float32_array(X) -> np.ndarray:
+	"""Convert vectorizer output to dense float32 numpy array."""
+	if hasattr(X, "toarray"):
+		X = X.toarray()
+	elif isinstance(X, pd.DataFrame):
+		X = X.to_numpy()
+	return np.asarray(X, dtype=np.float32)
+
+
+def _vectorize_tabular_splits(
+	X_train: np.ndarray,
+	X_val: np.ndarray,
+	X_test: np.ndarray,
+	feature_names: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Fit TableVectorizer on train tabular data and transform val/test."""
+	if X_train.ndim != 2 or X_val.ndim != 2 or X_test.ndim != 2:
+		raise ValueError("Expected 2D tabular arrays for train/val/test")
+
+	if feature_names is not None and len(feature_names) == X_train.shape[1]:
+		columns = feature_names
+	else:
+		columns = [f"col_{i}" for i in range(X_train.shape[1])]
+
+	vectorizer = TableVectorizer()
+	train_df = pd.DataFrame(X_train, columns=columns)
+	val_df = pd.DataFrame(X_val, columns=columns)
+	test_df = pd.DataFrame(X_test, columns=columns)
+
+	X_train_vec = _to_dense_float32_array(vectorizer.fit_transform(train_df))
+	X_val_vec = _to_dense_float32_array(vectorizer.transform(val_df))
+	X_test_vec = _to_dense_float32_array(vectorizer.transform(test_df))
+	return X_train_vec, X_val_vec, X_test_vec
 
 
 def _load_data(
 	dataset: str, data_dir: Path, module_path: Path, need_images: bool,
+	feature_source: str = "dinov3",
+	use_text: bool = False,
+	mimic_task: str = "los_classification",
+	mimic_cxr_target_mode: str = "binary",
+	mimic_cxr_binary_positive_label: str = "Atelectasis",
+	mimic_cxr_multiclass_labels: list[str] | None = None,
 ):
 	"""Load a dataset and extract numpy arrays for each split.
 
 	Dispatches to the correct loader based on *dataset* (e.g. ``'dvm'``,
-	``'petfinder'``).  Returns ``(data_root, splits)`` where *splits* maps
-	split name to ``(X_tab, X_img | None, y)``.
+	``'petfinder'``, ``'mimic'``).  Returns ``(data_root, splits)`` where *splits* maps
+	split name to ``(X_tab, X_img | None, X_text | None, y)``.
 	"""
 	cfg = DATASET_CONFIGS[dataset]
 	load_fn = _import_dataset_loader(module_path, cfg["loader_fn"])
@@ -168,9 +227,8 @@ def _load_data(
 	elif dataset == "petfinder":
 		data_root = data_dir
 		train_loader, val_loader, test_loader, _metadata = load_fn(
-			processed_dir=data_dir / "preprocessed",
-			pt_path=data_dir / "petfinder_dinov3_features.pt",
-			batch_size=2048, num_workers=0, use_images=need_images,
+			feature_source=feature_source,
+			batch_size=2048, num_workers=0, use_images=need_images, use_text=use_text,
 		)
 	elif dataset == "paintings":
 		data_root = data_dir
@@ -179,16 +237,84 @@ def _load_data(
 			pt_path=data_dir / "paintings_dinov3_features.pt",
 			batch_size=2048, num_workers=0, use_images=need_images,
 		)
+	elif dataset == "mimic":
+		if mimic_task == "cxr" and mimic_cxr_target_mode == "multilabel":
+			raise ValueError(
+				"mimic-task='cxr' with mimic-cxr-target-mode='multilabel' is not supported "
+				"by experiments.py yet because the current runner expects one target per row. "
+				"Use --mimic-cxr-target-mode binary or multiclass."
+			)
+		data_root = data_dir
+		train_loader, val_loader, test_loader, _metadata = load_fn(
+			processed_dir=None,
+			csv_path=data_dir / "final_dataframe.csv",
+			use_one_subject_csv=True,
+			task=mimic_task,
+			cxr_target_mode=mimic_cxr_target_mode,
+			cxr_binary_positive_label=mimic_cxr_binary_positive_label,
+			cxr_multiclass_labels=(
+				mimic_cxr_multiclass_labels
+				if mimic_cxr_multiclass_labels is not None
+				else [
+					"Atelectasis",
+					"Cardiomegaly",
+					"Edema",
+					"Pleural Effusion",
+					"Consolidation",
+				]
+			),
+			batch_size=2048,
+			num_workers=0,
+			use_images=need_images,
+			#image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features",
+			image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features-rad-dino-mean",
+			missing_image_features='drop'
+		)
 	else:
 		raise ValueError(f"Unknown dataset: {dataset}")
 
-	task = str(_metadata.get("task", "classification")).lower()
+	task_raw = str(_metadata.get("task", "classification")).lower()
+	if task_raw in ("regression", "los_regression"):
+		task = "regression"
+	elif task_raw in ("classification", "mortality", "los_classification", "cxr"):
+		task = "classification"
+	else:
+		raise ValueError(f"Unsupported task '{task_raw}' in dataset metadata")
+
+	_metadata = dict(_metadata)
+	_metadata["task_name"] = task_raw
+	_metadata["task"] = task
 
 	print(f"Extracting full train / val / test features from {dataset} dataset (task={task})...")
 	splits = {
 		name: _extract_modalities_from_dataset(loader.dataset, task=task)
 		for name, loader in [("train", train_loader), ("val", val_loader), ("test", test_loader)]
 	}
+
+	feature_names = _metadata.get("feature_cols")
+	if feature_names is not None and not isinstance(feature_names, list):
+		feature_names = None
+
+	X_tab_train, X_img_train, X_text_train, y_train = splits["train"]
+	X_tab_val, X_img_val, X_text_val, y_val = splits["val"]
+	X_tab_test, X_img_test, X_text_test, y_test = splits["test"]
+
+	X_tab_train, X_tab_val, X_tab_test = _vectorize_tabular_splits(
+		X_tab_train,
+		X_tab_val,
+		X_tab_test,
+		feature_names=feature_names,
+	)
+
+	splits = {
+		"train": (X_tab_train, X_img_train, X_text_train, y_train),
+		"val": (X_tab_val, X_img_val, X_text_val, y_val),
+		"test": (X_tab_test, X_img_test, X_text_test, y_test),
+	}
+	print(
+		f"[info] TableVectorizer tabular dims: "
+		f"train={X_tab_train.shape[1]} val={X_tab_val.shape[1]} test={X_tab_test.shape[1]}"
+	)
 	return data_root, splits, _metadata
 
 
@@ -225,6 +351,56 @@ def _sample_indices(y: np.ndarray, n: int | None, seed: int, task: str) -> np.nd
 def _maybe_index(arr: np.ndarray | None, idx: np.ndarray) -> np.ndarray | None:
 	"""Index into *arr* if it is not ``None``."""
 	return None if arr is None else arr[idx]
+
+
+def _balanced_classification_indices(
+	y: np.ndarray,
+	seed: int,
+	strategy: str = "oversample",
+	target_count: int | None = None,
+) -> np.ndarray:
+	"""Return indices for configurable class balancing.
+
+	Strategies:
+	- ``oversample``: sample each class up to ``target_count`` (or max class size).
+	- ``undersample``: sample each class down to ``target_count`` (or min class size).
+	- ``cap_majority``: keep classes <= ``target_count`` and subsample larger classes.
+	"""
+	if strategy not in ("oversample", "undersample", "cap_majority"):
+		raise ValueError(f"Unknown balance strategy: {strategy}")
+
+	y = np.asarray(y).reshape(-1)
+	classes, counts = np.unique(y, return_counts=True)
+	if len(classes) <= 1:
+		return np.arange(len(y), dtype=np.int64)
+
+	if strategy == "oversample":
+		default_target = int(np.max(counts))
+	elif strategy == "undersample":
+		default_target = int(np.min(counts))
+	else:
+		default_target = int(np.max(counts))
+	target = int(default_target if target_count is None else target_count)
+	if target <= 0:
+		raise ValueError("balance target_count must be > 0")
+	rng = np.random.default_rng(seed)
+	parts: list[np.ndarray] = []
+
+	for cls in classes:
+		cls_idx = np.flatnonzero(y == cls)
+		if strategy == "oversample":
+			take = rng.choice(cls_idx, size=target, replace=True)
+		elif strategy == "undersample":
+			size = min(target, len(cls_idx))
+			take = rng.choice(cls_idx, size=size, replace=False)
+		else:  # cap_majority
+			size = min(target, len(cls_idx))
+			take = rng.choice(cls_idx, size=size, replace=False)
+		parts.append(np.asarray(take, dtype=np.int64))
+
+	balanced = np.concatenate(parts)
+	rng.shuffle(balanced)
+	return balanced
 
 
 # ===================================================================
@@ -375,6 +551,7 @@ def _build_features(
 	mode: str,
 	X_tab: tuple[np.ndarray, np.ndarray, np.ndarray],
 	X_img: tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None],
+	X_text: tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None],
 	reducer_name: str,
 	reducer_dim: int,
 	seed: int,
@@ -383,7 +560,7 @@ def _build_features(
 	"""Assemble final feature matrices for ``(train, val, test)``.
 
 	In probing mode (*X_rep* provided), representations *replace* raw tabular
-	features.  Image features are processed with optional reduction.
+	features. Embedding features are processed with optional reduction.
 
 	Returns ``(X_train, X_val, X_test, fitted_reducer | None)``.
 	"""
@@ -398,22 +575,72 @@ def _build_features(
 		return tab_train, tab_val, tab_test, None
 
 	img_train, img_val, img_test = X_img
-	if img_train is None or img_val is None or img_test is None:
-		raise ValueError(
-			f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
-		)
-
-	reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
-	img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
+	text_train, text_val, text_test = X_text
 
 	if mode == "image":
+		if img_train is None or img_val is None or img_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
+			)
+		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
 		return img_train, img_val, img_test, reducer
 
+	if mode == "text":
+		if text_train is None or text_val is None or text_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires text embeddings, but the dataset has none."
+			)
+		reducer = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
+		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test)
+		return text_train, text_val, text_test, reducer
+
 	if mode == "concat":
+		if img_train is None or img_val is None or img_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
+			)
+		if text_train is None or text_val is None or text_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires text embeddings, but the dataset has none. "
+				"Use feature_mode='concat_image' to concatenate tabular+image only."
+			)
+		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
+		reducer_text = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
+		text_train, text_val, text_test = _apply_reducer(reducer_text, text_train, text_val, text_test)
+		return (
+			np.concatenate([tab_train, img_train, text_train], axis=1),
+			np.concatenate([tab_val, img_val, text_val], axis=1),
+			np.concatenate([tab_test, img_test, text_test], axis=1),
+			{"image_reducer": reducer, "text_reducer": reducer_text},
+		)
+
+	if mode == "concat_image":
+		if img_train is None or img_val is None or img_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
+			)
+		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
 		return (
 			np.concatenate([tab_train, img_train], axis=1),
 			np.concatenate([tab_val, img_val], axis=1),
 			np.concatenate([tab_test, img_test], axis=1),
+			reducer,
+		)
+
+	if mode == "concat_text":
+		if text_train is None or text_val is None or text_test is None:
+			raise ValueError(
+				f"feature_mode='{mode}' requires text embeddings, but the dataset has none."
+			)
+		reducer = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
+		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test)
+		return (
+			np.concatenate([tab_train, text_train], axis=1),
+			np.concatenate([tab_val, text_val], axis=1),
+			np.concatenate([tab_test, text_test], axis=1),
 			reducer,
 		)
 
@@ -590,9 +817,35 @@ def _evaluate_model(task: str, clf, X, y) -> dict[str, float]:
 			"r2": float(r2_score(y_true, y_pred)),
 			"eval_seconds": float(time.time() - start),
 		}
+
+	y_score = None
+	if hasattr(clf, "predict_proba"):
+		try:
+			y_score = np.asarray(clf.predict_proba(X))
+		except Exception:
+			y_score = None
+	elif hasattr(clf, "decision_function"):
+		try:
+			y_score = np.asarray(clf.decision_function(X))
+		except Exception:
+			y_score = None
+
+	auroc = None
+	if y_score is not None:
+		try:
+			if y_score.ndim == 2 and y_score.shape[1] == 2:
+				auroc = float(roc_auc_score(y_true, y_score[:, 1]))
+			elif y_score.ndim == 1:
+				auroc = float(roc_auc_score(y_true, y_score))
+			else:
+				auroc = float(roc_auc_score(y_true, y_score, multi_class="ovr", average="macro"))
+		except Exception:
+			auroc = None
+
 	return {
 		"accuracy": float(accuracy_score(y_true, y_pred)),
 		"f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+		"auroc": auroc,
 		"eval_seconds": float(time.time() - start),
 	}
 
@@ -668,10 +921,19 @@ def _run_probing_head(
 
 	def _eval_cls(X, y):
 		t = time.time()
-		preds, _ = predict_head(head, X, device=probe_device)
+		preds, probs = predict_head(head, X, device=probe_device)
+		auroc = None
+		try:
+			if probs.ndim == 2 and probs.shape[1] == 2:
+				auroc = float(roc_auc_score(y, probs[:, 1]))
+			else:
+				auroc = float(roc_auc_score(y, probs, multi_class="ovr", average="macro"))
+		except Exception:
+			auroc = None
 		return {
 			"accuracy": float(accuracy_score(y, preds)),
 			"f1_macro": float(f1_score(y, preds, average="macro", zero_division=0)),
+			"auroc": auroc,
 			"eval_seconds": float(time.time() - t),
 		}
 
@@ -684,13 +946,17 @@ def _print_model_results(name: str, results: dict) -> None:
 	print(f"\n[{name}]")
 	print(f"  Fit  | time={fit['fit_seconds']:.2f}s")
 	if "accuracy" in val:
+		val_auroc = val.get("auroc")
+		test_auroc = test.get("auroc")
+		val_auroc_str = f"{val_auroc:.4f}" if val_auroc is not None else "n/a"
+		test_auroc_str = f"{test_auroc:.4f}" if test_auroc is not None else "n/a"
 		print(
 			f"  Val  | acc={val['accuracy']:.4f}, "
-			f"f1_macro={val['f1_macro']:.4f}, time={val['eval_seconds']:.2f}s"
+			f"f1_macro={val['f1_macro']:.4f}, auroc={val_auroc_str}, time={val['eval_seconds']:.2f}s"
 		)
 		print(
 			f"  Test | acc={test['accuracy']:.4f}, "
-			f"f1_macro={test['f1_macro']:.4f}, time={test['eval_seconds']:.2f}s"
+			f"f1_macro={test['f1_macro']:.4f}, auroc={test_auroc_str}, time={test['eval_seconds']:.2f}s"
 		)
 	else:
 		print(
@@ -738,17 +1004,36 @@ def run_experiment(
 	dim_augmenter: str,
 	dim_augment_dim: int | None,
 	tabicl_features_dir: Path | None = None,
+	feature_source: str = "dinov3",
+	use_text: bool = False,
+	mimic_task: str = "los_classification",
+	mimic_cxr_target_mode: str = "binary",
+	mimic_cxr_binary_positive_label: str = "Atelectasis",
+	mimic_cxr_multiclass_labels: list[str] | None = None,
+	balance_train: bool = False,
+	balance_strategy: str = "oversample",
+	balance_target_count: int | None = None,
 ) -> None:
 	# --- Data loading ------------------------------------------------
-	need_images = feature_suite or feature_mode in ("image", "concat")
-	data_root, splits, dataset_metadata = _load_data(dataset, data_dir, module_path, need_images)
+	need_images = feature_suite or feature_mode in ("image", "concat", "concat_image")
+	need_text = use_text or feature_mode in ("text", "concat", "concat_text")
+	data_root, splits, dataset_metadata = _load_data(
+		dataset, data_dir, module_path, need_images,
+		feature_source=feature_source,
+		use_text=need_text,
+		mimic_task=mimic_task,
+		mimic_cxr_target_mode=mimic_cxr_target_mode,
+		mimic_cxr_binary_positive_label=mimic_cxr_binary_positive_label,
+		mimic_cxr_multiclass_labels=mimic_cxr_multiclass_labels,
+	)
 	task = str(dataset_metadata.get("task", "classification")).lower()
 	if task not in ("classification", "regression"):
 		raise ValueError(f"Unsupported task '{task}' in dataset metadata")
 
 	X_tab_full = {s: d[0] for s, d in splits.items()}
 	X_img_full = {s: d[1] for s, d in splits.items()}
-	y_full     = {s: d[2] for s, d in splits.items()}
+	X_text_full = {s: d[2] for s, d in splits.items()}
+	y_full     = {s: d[3] for s, d in splits.items()}
 
 	# --- Feature experiment configs ----------------------------------
 	feature_experiments = _resolve_feature_experiments(
@@ -765,6 +1050,8 @@ def run_experiment(
 	y_test = y_full["test"][test_idx]
 	X_img_val  = _maybe_index(X_img_full["val"],  val_idx)
 	X_img_test = _maybe_index(X_img_full["test"], test_idx)
+	X_text_val  = _maybe_index(X_text_full["val"],  val_idx)
+	X_text_test = _maybe_index(X_text_full["test"], test_idx)
 
 	# --- Train sizes -------------------------------------------------
 	train_sizes_to_run = (
@@ -806,9 +1093,16 @@ def run_experiment(
 		print(f"  tabular    : {X_tab_full['train'].shape}  task=regression")
 	if X_img_full["train"] is not None:
 		print(f"  image      : {X_img_full['train'].shape}")
+	if X_text_full["train"] is not None:
+		print(f"  text       : {X_text_full['train'].shape}")
 	if dim_augmenter != "none":
 		print(f"  dim_aug    : {dim_augmenter} -> target_dim={dim_augment_dim}")
 	print(f"  methods    : {selected_methods}")
+	if balance_train:
+		print(
+			f"  balance    : enabled ({balance_strategy})"
+			f" target={balance_target_count if balance_target_count is not None else 'auto'}"
+		)
 	print(f"  train sizes: {train_sizes_to_run}\n")
 
 	# --- Results container --------------------------------------------
@@ -816,7 +1110,17 @@ def run_experiment(
 		"metadata": {
 			"dataset": dataset, "data_root": str(data_root),
 			"task": task,
+			"task_name": str(dataset_metadata.get("task_name", "")),
+			"mimic_task": mimic_task,
+			"mimic_cxr_target_mode": mimic_cxr_target_mode,
+			"mimic_cxr_binary_positive_label": mimic_cxr_binary_positive_label,
+			"mimic_cxr_multiclass_labels": mimic_cxr_multiclass_labels,
 			"seed": seed, "device": device,
+			"feature_source": feature_source,
+			"use_text": use_text,
+			"balance_train": balance_train,
+			"balance_strategy": balance_strategy,
+			"balance_target_count": balance_target_count,
 			"dim_augmenter": dim_augmenter,
 			"dim_augment_dim": dim_augment_dim,
 			"probing_mode": probing_mode,
@@ -841,6 +1145,27 @@ def run_experiment(
 		X_tab_train = X_tab_full["train"][train_idx]
 		y_train     = y_full["train"][train_idx]
 		X_img_train = _maybe_index(X_img_full["train"], train_idx)
+		X_text_train = _maybe_index(X_text_full["train"], train_idx)
+
+		if balance_train:
+			if task != "classification":
+				print("[warning] --balance-train is enabled but task is regression; skipping balancing.")
+			else:
+				before_classes, before_counts = np.unique(y_train, return_counts=True)
+				balance_idx = _balanced_classification_indices(
+					y_train,
+					seed=seed,
+					strategy=balance_strategy,
+					target_count=balance_target_count,
+				)
+				X_tab_train = X_tab_train[balance_idx]
+				y_train = y_train[balance_idx]
+				X_img_train = _maybe_index(X_img_train, balance_idx)
+				X_text_train = _maybe_index(X_text_train, balance_idx)
+				after_classes, after_counts = np.unique(y_train, return_counts=True)
+				before_map = {int(c): int(n) for c, n in zip(before_classes, before_counts)}
+				after_map = {int(c): int(n) for c, n in zip(after_classes, after_counts)}
+				print(f"[info] Balanced train classes ({balance_strategy}): {before_map} -> {after_map}")
 
 		label = "all" if train_size is None else str(train_size)
 		print(f"\n=== Train size: {label} | actual: {len(y_train)} ===")
@@ -888,6 +1213,7 @@ def run_experiment(
 					mode=cfg_mode,
 					X_tab=(X_tab_train, X_tab_val, X_tab_test),
 					X_img=(X_img_train, X_img_val, X_img_test),
+					X_text=(X_text_train, X_text_val, X_text_test),
 					reducer_name=cfg_reducer,
 					reducer_dim=cfg_dim,
 					seed=seed,
@@ -914,14 +1240,19 @@ def run_experiment(
 
 			for model_name in selected_methods:
 				X_train_f, X_val_f, X_test_f, fitted_reducer, fitted_augmenter = _features_for_method(model_name)
-				feature_source = (
+				model_feature_source = (
 					"tabicl_representations"
 					if model_name in PROBING_METHODS and probing_reps_supported
 					else ("assembled_features" if model_name in PROBING_METHODS else "raw_tabular")
 				)
-				print(f"[info] {model_name} feature_source: {feature_source} | dim={X_train_f.shape[1]}")
+				print(f"[info] {model_name} feature_source: {model_feature_source} | dim={X_train_f.shape[1]}")
 				if fitted_reducer is not None:
-					print(f"[info] Reducer: {cfg_reducer} (dim={getattr(fitted_reducer, 'n_components', '?')})")
+					if isinstance(fitted_reducer, dict):
+						img_dim = getattr(fitted_reducer.get("image_reducer"), "n_components", "?")
+						text_dim = getattr(fitted_reducer.get("text_reducer"), "n_components", "?")
+						print(f"[info] Reducers: image={cfg_reducer}({img_dim}) text={cfg_reducer}({text_dim})")
+					else:
+						print(f"[info] Reducer: {cfg_reducer} (dim={getattr(fitted_reducer, 'n_components', '?')})")
 				if fitted_augmenter is not None:
 					if dim_augmenter == "gaussian_append":
 						print(f"[info] Dim augmenter: gaussian_append (+{fitted_augmenter['extra_dim']})")
@@ -1019,7 +1350,10 @@ def parse_args() -> argparse.Namespace:
 		help="Subset of methods to evaluate")
 
 	# Features
-	p.add_argument("--feature-mode", type=str, choices=["tabular", "image", "concat"], default="tabular")
+	p.add_argument("--feature-mode", type=str, choices=["tabular", "image", "text", "concat", "concat_image", "concat_text"], default="tabular")
+	p.add_argument("--feature-source", "--image-source", dest="feature_source", type=str,
+		choices=["dinov3", "vertexai", "dinov3_text"], default="dinov3",
+		help="Embedding source for supported dataset loaders. PetFinder supports dinov3, vertexai, and dinov3_text.")
 	p.add_argument("--image-reducer", type=str, choices=["none", "pca", "ica", "random_projection"], default="none")
 	p.add_argument("--image-reducer-dim", type=int, default=128)
 	p.add_argument("--feature-suite", action="store_true",
@@ -1033,14 +1367,51 @@ def parse_args() -> argparse.Namespace:
 
 	# Device
 	p.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+	p.add_argument("--balance-train", action="store_true",
+		help="Artificially balance the sampled training split (classification tasks only)")
+	p.add_argument("--balance-strategy", type=str, choices=["oversample", "undersample", "cap_majority"], default="oversample",
+		help="Class balancing strategy used when --balance-train is enabled")
+	p.add_argument("--balance-target-count", type=int, default=None,
+		help=(
+			"Optional target class count used by balancing. "
+			"For undersample/oversample this is per-class target; "
+			"for cap_majority this is the per-class cap."
+		))
 	p.add_argument("--dim-augmenter", type=str, choices=DIM_AUGMENTERS, default="none",
 		help="Optional post-assembly dimensionality increase method")
 	p.add_argument("--dim-augment-dim", type=int, default=None,
 		help="Target feature dimension after --dim-augmenter (must be > input dim)")
+	p.add_argument("--use-text", action="store_true",
+		help="Request text embeddings from dataset loaders that support them. Required for text, concat, and concat_text modes.")
+
+
+	# MIMIC-specific options
+	p.add_argument("--mimic-task", type=str, 
+		choices=["mortality", "los_classification", "los_regression", "cxr"],
+		default="los_classification",
+		help="Task to use when dataset is MIMIC (default: los_classification)")
+	p.add_argument(
+		"--mimic-cxr-target-mode",
+		type=str,
+		choices=["multilabel", "binary", "multiclass"],
+		default="binary",
+		help="CXR target mode when --dataset mimic and --mimic-task cxr (default: binary)",
+	)
+	p.add_argument(
+		"--mimic-cxr-binary-positive-label",
+		type=str,
+		default="Atelectasis",
+		help="Positive class label when --mimic-cxr-target-mode binary",
+	)
+	p.add_argument(
+		"--mimic-cxr-multiclass-labels",
+		type=str,
+		nargs="+",
+		default=["Atelectasis", "Cardiomegaly", "Edema", "Pleural Effusion", "Consolidation"],
+		help="Class labels when --mimic-cxr-target-mode multiclass",
+	)
 
 	return p.parse_args()
-
-
 def main() -> None:
 	args = parse_args()
 	cfg = DATASET_CONFIGS[args.dataset]
@@ -1091,6 +1462,15 @@ def main() -> None:
 			dim_augmenter=args.dim_augmenter,
 			dim_augment_dim=args.dim_augment_dim,
 			tabicl_features_dir=args.tabicl_features_dir,
+			feature_source=args.feature_source,
+			use_text=args.use_text,
+			mimic_task=args.mimic_task,
+			mimic_cxr_target_mode=args.mimic_cxr_target_mode,
+			mimic_cxr_binary_positive_label=args.mimic_cxr_binary_positive_label,
+			mimic_cxr_multiclass_labels=args.mimic_cxr_multiclass_labels,
+			balance_train=args.balance_train,
+			balance_strategy=args.balance_strategy,
+			balance_target_count=args.balance_target_count,
 		)
 
 

@@ -8,6 +8,7 @@ Dataloaders for 5 Kaggle datasets:
 """
 
 import os
+import json
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -258,19 +259,23 @@ class PetFinderDataset(Dataset):
         split: str = "train",  # "train" or "test"
         image_transform: Optional[transforms.Compose] = None,
         return_image: bool = True,
+        return_text: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.split = split
         self.return_image = return_image
+        self.return_text = return_text
         
         if split == "train":
             self.csv_path = self.data_dir / "train" / "train.csv"
             self.image_dir = self.data_dir / "train_images"
             self.metadata_dir = self.data_dir / "train_metadata"
+            self.sentiment_dir = self.data_dir / "train_sentiment"
         else:
             self.csv_path = self.data_dir / "test" / "test.csv"
             self.image_dir = self.data_dir / "test_images"
             self.metadata_dir = self.data_dir / "test_metadata"
+            self.sentiment_dir = self.data_dir / "test_sentiment"
         
         self.df = pd.read_csv(self.csv_path)
         
@@ -296,6 +301,27 @@ class PetFinderDataset(Dataset):
     def get_feature_columns(self) -> List[str]:
         """Return list of feature column names."""
         return ['Type', 'Age', 'Gender', 'MaturitySize', 'FurLength', 'Vaccinated', 'Dewormed', 'Sterilized', 'Health']
+
+    def _load_sentiment_text(self, pet_id: str) -> str:
+        """Load and concatenate sentiment sentence text for a pet."""
+        sentiment_path = self.sentiment_dir / f"{pet_id}.json"
+        if not sentiment_path.exists():
+            return ""
+
+        try:
+            with sentiment_path.open("r", encoding="utf-8") as f:
+                sentiment_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return ""
+
+        sentences = sentiment_data.get("sentences", [])
+        text_chunks = []
+        for sentence in sentences:
+            content = sentence.get("text", {}).get("content", "")
+            if content:
+                text_chunks.append(content.strip())
+
+        return " ".join(text_chunks)
     
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
@@ -311,6 +337,9 @@ class PetFinderDataset(Dataset):
                 image = Image.open(image_path).convert('RGB')
                 image = self.image_transform(image)
                 data['image'] = image
+
+        if self.return_text:
+            data['text'] = self._load_sentiment_text(pet_id)
         
         # Tabular features
         feature_dict = {
