@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from finetune_projection_head import FrozenTabICLConfig
-from imagenet_projection.checkpoints import save_projection_checkpoint
+from imagenet_projection.save_checkpoints import save_projection_checkpoint
 from imagenet_projection.config import ExtractConfig, SamplingConfig
 from imagenet_projection.extraction import extract_split, load_dinov3, resolve_device
 from imagenet_projection.sampling import sample_datasets_loop
@@ -25,6 +27,14 @@ def _enable_live_output() -> None:
         sys.stderr.reconfigure(line_buffering=True, write_through=True)
     except Exception:
         pass
+
+
+def _sanitize_run_name(raw_name: str | None) -> str:
+    """Normalize run name into a filesystem-safe slug."""
+    if raw_name is None:
+        return "run"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._-")
+    return cleaned or "run"
 
 
 def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
@@ -99,10 +109,53 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
             "maximum throughput; 'shard' keeps lower memory usage but higher per-step I/O."
         ),
     )
+    parser.add_argument(
+        "--sampling-distribution",
+        type=str,
+        choices=["uniform", "log-uniform"],
+        default="log-uniform",
+        help=(
+            "Dataset size sampling strategy. 'log-uniform' samples in log-space to favor "
+            "smaller datasets (aligns with scaling laws); 'uniform' samples linearly."
+        ),
+    )
+    parser.add_argument(
+        "--enable-hard-sampling",
+        action="store_true",
+        help=(
+            "Enable hard negative class sampling using cosine similarity of class centroids. "
+            "This selects more challenging classification tasks by favoring similar classes."
+        ),
+    )
+    parser.add_argument(
+        "--hard-sampling-temperature",
+        type=float,
+        default=0.1,
+        help="Temperature for hard sampling softmax. Lower = stricter nearest neighbor selection.",
+    )
+    parser.add_argument(
+        "--hard-sampling-prob",
+        type=float,
+        default=0.5,
+        help="Probability of using hard sampling (vs. uniform). Default 0.5 = 50/50 split.",
+    )
+    parser.add_argument(
+        "--hard-sampling-device",
+        type=str,
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device for hard sampling similarity matrix computation.",
+    )
     parser.add_argument("--sample-output-dir", type=Path, default=None, help="Optional directory to persist sampled datasets as .npz files.")
     parser.add_argument("--train-steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--ortho-lambda",
+        type=float,
+        default=0.01,
+        help="Scale for orthogonal regularization on hypernetwork-generated projection matrix W.",
+    )
     parser.add_argument("--head-type", type=str, choices=["linear", "mlp"], default="linear")
     parser.add_argument(
         "--projection-method",
@@ -142,6 +195,14 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         default=2,
         help="Number of transformer encoder layers when --hyper-encoder-type attention.",
     )
+    parser.add_argument(
+        "--disable-random-projection-init",
+        action="store_true",
+        help=(
+            "Use standard PyTorch initialization for hypernetwork decoders instead of "
+            "random-projection initialization."
+        ),
+    )
     parser.add_argument("--head-hidden-dim", type=int, default=256)
     parser.add_argument("--head-dropout", type=float, default=0.0)
     parser.add_argument("--query-fraction-min", type=float, default=0.1)
@@ -157,9 +218,9 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
             "Useful for larger effective batch sizes with limited GPU memory."
         ),
     )
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--val-split", type=str, choices=["none", "train", "val"], default="val")
-    parser.add_argument("--val-every", type=int, default=100)
+    parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument(
         "--val-heldout-classes",
@@ -175,6 +236,30 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     parser.add_argument("--tabicl-softmax-temperature", type=float, default=0.9)
     parser.add_argument("--tabicl-checkpoint-version", type=str, default="tabicl-classifier-v2-20260212.ckpt")
     parser.add_argument("--tabicl-model-path", type=Path, default=None)
+    parser.add_argument("--disable-wandb", action="store_true", help="Disable Weights & Biases logging.")
+    parser.add_argument("--wandb-project", type=str, default="imagenet-projection")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("model_weights/hypernetwork_checkpoints"),
+        help=(
+            "Base directory for training checkpoints. "
+            "A per-run subdirectory <wandb-run-name>_<timestamp> is created automatically. "
+            "When --resume-training is used, this should point to a specific existing run directory."
+        ),
+    )
+    parser.add_argument(
+        "--resume-training",
+        action="store_true",
+        help="Resume training loop state from checkpoint-dir/latest.pt if present.",
+    )
+    parser.add_argument(
+        "--checkpoint-interval-steps",
+        type=int,
+        default=500,
+        help="Save latest training checkpoint every N optimization steps.",
+    )
     parser.add_argument("--train-output", type=Path, default=None, help="Optional path to save trained head checkpoint (.pt).")
 
     args = parser.parse_args()
@@ -205,6 +290,8 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         raise ValueError("--train-steps must be > 0")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be > 0")
+    if args.ortho_lambda < 0:
+        raise ValueError("--ortho-lambda must be >= 0")
     if args.projection_dim <= 0:
         raise ValueError("--projection-dim must be > 0")
     if args.zca_epsilon <= 0:
@@ -235,6 +322,13 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         raise ValueError("--val-batches must be > 0")
     if args.tabicl_train_shuffles <= 0:
         raise ValueError("--tabicl-train-shuffles must be > 0")
+    if args.checkpoint_interval_steps <= 0:
+        raise ValueError("--checkpoint-interval-steps must be > 0")
+    if args.enable_hard_sampling:
+        if not (0.0 < args.hard_sampling_temperature <= 1.0):
+            raise ValueError("--hard-sampling-temperature must be in (0, 1]")
+        if not (0.0 < args.hard_sampling_prob <= 1.0):
+            raise ValueError("--hard-sampling-prob must be in (0, 1]")
 
     splits = ["train", "val"] if args.split == "both" else [args.split]
     return args, ExtractConfig(
@@ -259,6 +353,7 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
 def main() -> None:
     _enable_live_output()
     args, config = parse_args()
+    execution_started_at = datetime.now()
     compact_args = {
         key: (str(value) if isinstance(value, Path) else value)
         for key, value in vars(args).items()
@@ -296,6 +391,11 @@ def main() -> None:
         allow_replacement=bool(args.allow_replacement),
         max_cached_shards=args.max_cached_shards,
         sampler_backend=args.sampler_backend,
+        sampling_distribution=args.sampling_distribution,
+        enable_hard_sampling=bool(args.enable_hard_sampling),
+        hard_sampling_temperature=args.hard_sampling_temperature,
+        hard_sampling_prob=args.hard_sampling_prob,
+        hard_sampling_device=args.hard_sampling_device,
     )
 
     if args.mode == "sample-loop":
@@ -318,6 +418,23 @@ def main() -> None:
 
         print("[done] Sample loop complete.")
         return
+
+    checkpoint_dir = args.checkpoint_dir
+    if args.mode == "train-loop":
+        if args.resume_training:
+            # Resume must target an explicit run directory to avoid ambiguity.
+            latest_checkpoint = checkpoint_dir / "latest.pt"
+            if not latest_checkpoint.exists():
+                raise ValueError(
+                    "--resume-training requires --checkpoint-dir to point to an existing "
+                    "run directory containing latest.pt"
+                )
+        else:
+            run_name_slug = _sanitize_run_name(args.wandb_run_name)
+            start_stamp = execution_started_at.strftime("%Y%m%d_%H%M%S")
+            checkpoint_dir = checkpoint_dir / f"{run_name_slug}_{start_stamp}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[info] Checkpoint directory: {checkpoint_dir}")
 
     tabicl_cfg = FrozenTabICLConfig(
         n_models=1,
@@ -348,6 +465,11 @@ def main() -> None:
             allow_replacement=bool(args.allow_replacement),
             max_cached_shards=args.max_cached_shards,
             sampler_backend=args.sampler_backend,
+            sampling_distribution=args.sampling_distribution,
+            enable_hard_sampling=bool(args.enable_hard_sampling),
+            hard_sampling_temperature=args.hard_sampling_temperature,
+            hard_sampling_prob=args.hard_sampling_prob,
+            hard_sampling_device=args.hard_sampling_device,
         )
         print(
             f"[info] Validation enabled: split={args.val_split} "
@@ -380,7 +502,15 @@ def main() -> None:
         hyper_encoder_type=args.hyper_encoder_type,
         hyper_attn_heads=args.hyper_attn_heads,
         hyper_attn_layers=args.hyper_attn_layers,
+        use_random_projection_init=not bool(args.disable_random_projection_init),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ortho_lambda=args.ortho_lambda,
+        enable_wandb=not bool(args.disable_wandb),
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        checkpoint_dir=checkpoint_dir,
+        resume_training=bool(args.resume_training),
+        checkpoint_interval_steps=args.checkpoint_interval_steps,
     )
 
     if args.train_output is not None:
@@ -403,6 +533,7 @@ def main() -> None:
                 "hyper_encoder_type": projection_meta.get("hyper_encoder_type"),
                 "hyper_attn_heads": projection_meta.get("hyper_attn_heads"),
                 "hyper_attn_layers": projection_meta.get("hyper_attn_layers"),
+                "hyper_use_random_projection_init": projection_meta.get("hyper_use_random_projection_init"),
             },
         )
         print(f"[done] Saved trained head checkpoint to: {args.train_output}")

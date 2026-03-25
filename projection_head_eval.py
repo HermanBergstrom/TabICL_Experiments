@@ -24,7 +24,7 @@ from tabicl import TabICLClassifier
 
 from experiments import DATASET_CONFIGS, DATASET_NAMES, _load_data, _sample_indices
 from finetune_projection_head import ProjectionHead
-from imagenet_projection.checkpoints import load_projection_head_checkpoint
+from imagenet_projection.save_checkpoints import load_projection_head_checkpoint
 
 try:
 	from huggingface_hub import hf_hub_download

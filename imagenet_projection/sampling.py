@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import SamplingConfig
@@ -16,6 +18,223 @@ from .config import SamplingConfig
 
 def _manifest_path(output_dir: Path, split: str) -> Path:
 	return output_dir / f"{split}_manifest.json"
+
+
+def _sample_from_distribution(
+	rng: np.random.Generator,
+	min_val: int,
+	max_val: int,
+	distribution: str = "log-uniform",
+) -> int:
+	"""Sample a value from specified distribution.
+
+	Args:
+		rng: Random number generator.
+		min_val: Minimum value (inclusive).
+		max_val: Maximum value (inclusive).
+		distribution: Sampling strategy ("uniform" or "log-uniform").
+
+	Returns:
+		Sampled value.
+	"""
+	if distribution == "log-uniform":
+		# Sample uniformly in log-space and exponentiate back.
+		log_min = math.log(float(min_val))
+		log_max = math.log(float(max_val))
+		log_sample = float(rng.uniform(log_min, log_max))
+		return int(math.exp(log_sample))
+	elif distribution == "uniform":
+		return int(rng.integers(min_val, max_val + 1))
+	else:
+		raise ValueError(
+			f"Unknown sampling_distribution: {distribution}. "
+			"Supported: 'uniform', 'log-uniform'"
+		)
+
+
+class HardNegativeClassSampler:
+	"""Hard negative class sampler using cosine similarity of class centroids.
+	
+	Selects challenging classification tasks by sampling classes that are
+	difficult to distinguish (similar in feature space) using a 50/50 strategy:
+	- 50% of the time: uniform random class selection
+	- 50% of the time: hard negatives guided by class centroid similarity
+	"""
+
+	def __init__(
+		self,
+		class_centroids: torch.Tensor,
+		device: torch.device | str = "cpu",
+		temperature: float = 0.1,
+	) -> None:
+		"""Initialize with class centroids and precompute similarity matrix.
+		
+		Args:
+			class_centroids: Tensor of shape [num_classes, feature_dim].
+			device: Device to place the similarity matrix on (GPU recommended).
+			temperature: Temperature parameter for softmax. Lower values enforce
+				stricter nearest neighbor selection. Default 0.1.
+		"""
+		self.device = torch.device(device) if isinstance(device, str) else device
+		self.temperature = temperature
+		self.num_classes = class_centroids.shape[0]
+
+		# L2-normalize centroids for cosine similarity computation
+		centroids_norm = F.normalize(class_centroids.to(self.device), p=2, dim=1)
+		
+		# Precompute the num_classes x num_classes cosine similarity matrix
+		# Value range: [-1, 1], where 1 indicates identical classes
+		self.sim_matrix = torch.matmul(centroids_norm, centroids_norm.T)
+
+	@torch.no_grad()
+	def sample_classes(
+		self,
+		k_classes: int,
+		hard_prob: float = 0.5,
+	) -> torch.Tensor:
+		"""Sample k_classes using hard negative sampling or uniform selection.
+		
+		With probability hard_prob, samples classes based on cosine similarity
+		to already-selected classes (hard negatives). Otherwise, samples uniformly.
+		
+		Args:
+			k_classes: Number of classes to sample.
+			hard_prob: Probability of using hard sampling (vs. uniform).
+				Default 0.5 (50/50 split).
+		
+		Returns:
+			Tensor of shape [k_classes] containing selected class indices.
+		
+		Raises:
+			ValueError: If k_classes > num_classes or k_classes <= 0.
+		"""
+		if k_classes <= 0:
+			raise ValueError(f"k_classes must be > 0, got {k_classes}")
+		if k_classes > self.num_classes:
+			raise ValueError(
+				f"k_classes={k_classes} exceeds num_classes={self.num_classes}"
+			)
+
+		# 50/50 coin flip: uniform or hard sampling
+		if torch.rand(1, device=self.device).item() > hard_prob:
+			return torch.randperm(self.num_classes, device=self.device)[:k_classes]
+
+		# Hard negative sampling: iteratively select difficult classes
+		selected = torch.zeros(k_classes, dtype=torch.long, device=self.device)
+
+		# Step 1: Pick the first class uniformly at random
+		selected[0] = torch.randint(0, self.num_classes, (1,), device=self.device)
+
+		# Track which classes have been selected
+		available_mask = torch.ones(self.num_classes, dtype=torch.bool, device=self.device)
+		available_mask[selected[0]] = False
+
+		# Track the maximum similarity to ANY already-selected class
+		# Initialized with the similarity row of the first selected class
+		current_max_sim = self.sim_matrix[selected[0]].clone()
+
+		# Step 2-K: Iteratively sample hard negatives
+		for i in range(1, k_classes):
+			# Create logits from similarity scores
+			logits = current_max_sim.clone()
+			
+			# Mask out already-selected classes by setting logits to -inf
+			# This ensures they get probability 0 after softmax
+			logits[~available_mask] = -float("inf")
+
+			# Apply temperature and convert to probabilities
+			probs = F.softmax(logits / self.temperature, dim=0)
+
+			# Sample the next class according to similarity-based probabilities
+			next_class = torch.multinomial(probs, num_samples=1)[0]
+			selected[i] = next_class
+
+			# Update: mark this class as selected
+			available_mask[next_class] = False
+			
+			# Magic step: Update running maximum similarity
+			# For each candidate class, track its maximum similarity to any
+			# already-selected class. Classes similar to already-selected ones
+			# become more likely to be selected (higher difficulty).
+			current_max_sim = torch.maximum(
+				current_max_sim,
+				self.sim_matrix[next_class]
+			)
+
+		return selected
+
+
+def _compute_class_centroids(
+	output_dir: Path,
+	split: str,
+	shards: list[dict[str, Any]],
+	num_classes: int,
+	device: torch.device | str = "cpu",
+) -> torch.Tensor:
+	"""Compute class centroids from shard data.
+	
+	Computes the mean feature vector for each class across all shards.
+	
+	Args:
+		output_dir: Path to directory containing shard files.
+		split: Data split name (e.g., "train", "val").
+		shards: List of shard metadata dictionaries.
+		num_classes: Total number of classes (e.g., 1000 for ImageNet).
+		device: Device to place centroids on (CPU by default, GPU for faster sampling).
+	
+	Returns:
+		Tensor of shape [num_classes, feature_dim] containing class centroids.
+	"""
+	if device is not None and not isinstance(device, torch.device):
+		device = torch.device(device)
+
+	# Accumulate features and counts per class
+	class_sum: dict[int, torch.Tensor] = {}
+	class_count: dict[int, int] = {}
+
+	with torch.no_grad():
+		for shard_meta in tqdm(shards, desc=f"compute centroids {split}"):
+			shard_id = int(shard_meta["shard_id"])
+			shard_path = output_dir / str(shard_meta["file"])
+			
+			if not shard_path.exists():
+				raise FileNotFoundError(f"Shard listed in manifest is missing: {shard_path}")
+
+			shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+			features = shard["features"].float()  # [num_samples, feature_dim]
+			targets = shard["targets"].long()  # [num_samples]
+
+			if not isinstance(features, torch.Tensor) or not isinstance(targets, torch.Tensor):
+				raise TypeError(f"Shard must contain tensor features and targets: {shard_path}")
+
+			# Accumulate by class
+			for class_id in range(num_classes):
+				mask = targets == class_id
+				if mask.any():
+					class_features = features[mask]
+					class_sum[class_id] = (
+						class_sum.get(class_id, torch.zeros_like(class_features[0]).cpu())
+						+ class_features.sum(dim=0).cpu()
+					)
+					class_count[class_id] = class_count.get(class_id, 0) + int(mask.sum().item())
+
+	# Compute centroids by averaging
+	centroids_list: list[torch.Tensor] = []
+	for class_id in range(num_classes):
+		if class_id in class_count and class_count[class_id] > 0:
+			centroid = class_sum[class_id] / class_count[class_id]
+		else:
+			# Handle missing classes with zero vector
+			# (Infer feature dim from first available centroid)
+			if centroids_list:
+				centroid = torch.zeros_like(centroids_list[0])
+			else:
+				# Fallback: assume 768-dim features (typical for ViT-B)
+				centroid = torch.zeros(768, dtype=torch.float32)
+		centroids_list.append(centroid)
+
+	centroids = torch.stack(centroids_list, dim=0).to(device)
+	return centroids
 
 
 class ShardedEmbeddingSampler:
@@ -30,6 +249,11 @@ class ShardedEmbeddingSampler:
 		max_cached_shards: int = 8,
 		sampler_backend: str = "shard",
 		excluded_classes: set[int] | None = None,
+		enable_hard_sampling: bool = False,
+		num_classes: int = 1000,
+		hard_sampling_temperature: float = 0.1,
+		hard_sampling_prob: float = 0.5,
+		hard_sampling_device: str = "cpu",
 	) -> None:
 		self.output_dir = output_dir
 		self.split = split
@@ -62,6 +286,23 @@ class ShardedEmbeddingSampler:
 			raise ValueError("Need at least 2 classes available for class-first sampling after excluding classes")
 
 		self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+
+		# Optional hard negative sampling
+		self.hard_sampler: HardNegativeClassSampler | None = None
+		self.hard_sampling_prob = hard_sampling_prob
+		if enable_hard_sampling:
+			centroids = _compute_class_centroids(
+				output_dir=output_dir,
+				split=split,
+				shards=self.shards,
+				num_classes=num_classes,
+				device=hard_sampling_device,
+			)
+			self.hard_sampler = HardNegativeClassSampler(
+				class_centroids=centroids,
+				device=hard_sampling_device,
+				temperature=hard_sampling_temperature,
+			)
 
 	def _preload_all_data(self) -> tuple[torch.Tensor, dict[int, list[int]]]:
 		"""Load all shard features into one tensor and build class->global-row index."""
@@ -194,8 +435,30 @@ class ShardedEmbeddingSampler:
 				f"Requested {n_classes} classes but only {len(self.available_classes)} are available"
 			)
 
-		class_ids = self.rng.choice(self.available_classes, size=n_classes, replace=False)
-		class_ids = np.asarray(class_ids, dtype=np.int64)
+		# Select classes: use hard negative sampling if available
+		if self.hard_sampler is not None:
+			# Hard sampling from all 1000 classes, then filter to available
+			all_classes_set = set(self.available_classes)
+			max_attempts = 10  # Prevent infinite loops
+			for attempt in range(max_attempts):
+				sampled = self.hard_sampler.sample_classes(
+					k_classes=n_classes,
+					hard_prob=self.hard_sampling_prob,
+				)
+				# Convert to available classes only
+				class_ids_list = [int(c) for c in sampled.cpu().tolist() if int(c) in all_classes_set]
+				if len(class_ids_list) >= n_classes:
+					class_ids = np.asarray(class_ids_list[:n_classes], dtype=np.int64)
+					break
+			else:
+				# Fallback to uniform sampling if hard sampling doesn't yield enough valid classes
+				class_ids = self.rng.choice(self.available_classes, size=n_classes, replace=False)
+				class_ids = np.asarray(class_ids, dtype=np.int64)
+		else:
+			# Uniform sampling from available classes
+			class_ids = self.rng.choice(self.available_classes, size=n_classes, replace=False)
+			class_ids = np.asarray(class_ids, dtype=np.int64)
+
 		counts = self._sample_class_counts(dataset_size, n_classes, min_per_class)
 		capacities = np.asarray(
 			[len(self.class_to_locations[int(cls)]) for cls in class_ids.tolist()],
@@ -282,6 +545,7 @@ class ShardedEmbeddingSampler:
 			"class_capacities": capacities.tolist(),
 			"shrunk_for_capacity": bool((not allow_replacement) and (int(X.shape[0]) < requested_size)),
 			"sampler_backend": self.sampler_backend,
+			"used_hard_sampling": self.hard_sampler is not None,
 		}
 		return np.asarray(X.numpy()), y_np, meta
 
@@ -296,6 +560,7 @@ def sample_one_dataset(
 	min_per_class: int,
 	remap_labels: bool,
 	allow_replacement: bool,
+	sampling_distribution: str = "log-uniform",
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
 	max_classes_allowed = min(max_classes, len(sampler.available_classes))
 	if min_classes > max_classes_allowed:
@@ -303,8 +568,18 @@ def sample_one_dataset(
 			f"min_classes={min_classes} exceeds available class count={max_classes_allowed}"
 		)
 
-	dataset_size = int(sampler.rng.integers(min_dataset_size, max_dataset_size + 1))
-	n_classes = int(sampler.rng.integers(min_classes, max_classes_allowed + 1))
+	dataset_size = _sample_from_distribution(
+		rng=sampler.rng,
+		min_val=min_dataset_size,
+		max_val=max_dataset_size,
+		distribution=sampling_distribution,
+	)
+	n_classes = _sample_from_distribution(
+		rng=sampler.rng,
+		min_val=min_classes,
+		max_val=max_classes_allowed,
+		distribution=sampling_distribution,
+	)
 	return sampler.sample_dataset(
 		dataset_size=dataset_size,
 		n_classes=n_classes,
@@ -322,6 +597,11 @@ def sample_datasets_loop(config: SamplingConfig):
 		seed=config.seed,
 		max_cached_shards=config.max_cached_shards,
 		sampler_backend=config.sampler_backend,
+		enable_hard_sampling=config.enable_hard_sampling,
+		num_classes=config.num_classes,
+		hard_sampling_temperature=config.hard_sampling_temperature,
+		hard_sampling_prob=config.hard_sampling_prob,
+		hard_sampling_device=config.hard_sampling_device,
 	)
 
 	max_classes_allowed = min(config.max_classes, len(sampler.available_classes))
@@ -331,11 +611,17 @@ def sample_datasets_loop(config: SamplingConfig):
 		)
 
 	for i in range(config.n_datasets):
-		dataset_size = int(
-			sampler.rng.integers(config.min_dataset_size, config.max_dataset_size + 1)
+		dataset_size = _sample_from_distribution(
+			rng=sampler.rng,
+			min_val=config.min_dataset_size,
+			max_val=config.max_dataset_size,
+			distribution=config.sampling_distribution,
 		)
-		n_classes = int(
-			sampler.rng.integers(config.min_classes, max_classes_allowed + 1)
+		n_classes = _sample_from_distribution(
+			rng=sampler.rng,
+			min_val=config.min_classes,
+			max_val=max_classes_allowed,
+			distribution=config.sampling_distribution,
 		)
 		X, y, meta = sampler.sample_dataset(
 			dataset_size=dataset_size,

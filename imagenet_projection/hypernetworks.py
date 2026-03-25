@@ -6,10 +6,18 @@ then predicts a per-episode linear projection matrix.
 
 from __future__ import annotations
 
+import time
 import torch
 import torch.nn as nn
 
 from .attention_spectral_encoder import AttentionSpectralEncoder
+from .attention_spectral_decoder import ParallelQueryDecoder
+
+
+def _synchronized_perf_counter(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
 
 
 def _init_generators_as_random_projection(
@@ -170,6 +178,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         low_rank_dim: int | None = None,
         tiny_weight_std: float = 1e-4,
         covariance_jitter: float = 1e-6,
+        use_random_projection_init: bool = True,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -188,6 +197,8 @@ class SpectralHypernetworkAdapter(nn.Module):
             raise ValueError("attention_num_layers must be > 0")
         if low_rank_dim is not None and low_rank_dim <= 0:
             raise ValueError("low_rank_dim must be > 0 when provided")
+        if encoder_type == "attention" and low_rank_dim is not None:
+            raise ValueError("low_rank_dim is only supported when encoder_type='mlp'")
         if tiny_weight_std <= 0:
             raise ValueError("tiny_weight_std must be > 0")
         if covariance_jitter <= 0:
@@ -198,6 +209,10 @@ class SpectralHypernetworkAdapter(nn.Module):
         self.top_k_components = int(top_k_components)
         self.encoder_type = str(encoder_type)
         self.low_rank_dim = int(low_rank_dim) if low_rank_dim is not None else None
+        self.use_random_projection_init = bool(use_random_projection_init)
+        self.query_decoder: ParallelQueryDecoder | None = None
+        self.output_bias: nn.Parameter | None = None
+        self.last_profile: dict[str, float] = {}
 
         if self.encoder_type == "mlp":
             self.encoder = SpectralContextEncoder(
@@ -214,38 +229,55 @@ class SpectralHypernetworkAdapter(nn.Module):
                 num_heads=int(attention_num_heads),
                 num_layers=int(attention_num_layers),
             )
+            self.query_decoder = ParallelQueryDecoder(
+                embed_dim=int(context_hidden_dim),
+                target_rows=self.input_dim,
+                output_cols=self.output_dim,
+                num_heads=int(attention_num_heads),
+                num_layers=int(attention_num_layers),
+            )
+            self.output_bias = nn.Parameter(torch.zeros(self.output_dim))
 
         context_dim = self.encoder.context_hidden_dim
         self.weight_generator: nn.Linear | None = None
         self.a_generator: nn.Linear | None = None
         self.b_generator: nn.Linear | None = None
 
-        if self.low_rank_dim is None:
-            self.weight_generator = nn.Linear(context_dim, self.input_dim * self.output_dim)
-        else:
-            self.a_generator = nn.Linear(context_dim, self.input_dim * self.low_rank_dim)
-            self.b_generator = nn.Linear(context_dim, self.low_rank_dim * self.output_dim)
-        self.bias_generator = nn.Linear(context_dim, self.output_dim)
-        if self.low_rank_dim is None:
-            _init_generators_as_random_projection(
-                weight_generator=self.weight_generator,
-                bias_generator=self.bias_generator,
-                input_dim=self.input_dim,
-                output_dim=self.output_dim,
-                tiny_weight_std=tiny_weight_std,
-            )
-        else:
-            _init_low_rank_generators_as_random_projection(
-                a_generator=self.a_generator,
-                b_generator=self.b_generator,
-                bias_generator=self.bias_generator,
-                input_dim=self.input_dim,
-                output_dim=self.output_dim,
-                rank=self.low_rank_dim,
-                tiny_weight_std=tiny_weight_std,
-            )
+        self.bias_generator: nn.Linear | None = None
+        if self.encoder_type == "mlp":
+            if self.low_rank_dim is None:
+                self.weight_generator = nn.Linear(context_dim, self.input_dim * self.output_dim)
+            else:
+                self.a_generator = nn.Linear(context_dim, self.input_dim * self.low_rank_dim)
+                self.b_generator = nn.Linear(context_dim, self.low_rank_dim * self.output_dim)
+            self.bias_generator = nn.Linear(context_dim, self.output_dim)
+            if self.use_random_projection_init:
+                if self.low_rank_dim is None:
+                    _init_generators_as_random_projection(
+                        weight_generator=self.weight_generator,
+                        bias_generator=self.bias_generator,
+                        input_dim=self.input_dim,
+                        output_dim=self.output_dim,
+                        tiny_weight_std=tiny_weight_std,
+                    )
+                else:
+                    _init_low_rank_generators_as_random_projection(
+                        a_generator=self.a_generator,
+                        b_generator=self.b_generator,
+                        bias_generator=self.bias_generator,
+                        input_dim=self.input_dim,
+                        output_dim=self.output_dim,
+                        rank=self.low_rank_dim,
+                        tiny_weight_std=tiny_weight_std,
+                    )
 
-    def forward(self, *, features: torch.Tensor, support_indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        *,
+        features: torch.Tensor,
+        support_indices: torch.Tensor,
+        return_projection_matrix: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project all episode rows using support-conditioned generated weights.
 
         Args:
@@ -268,17 +300,50 @@ class SpectralHypernetworkAdapter(nn.Module):
         support_mean = x_support.mean(dim=0, keepdim=True)
         x_target = features - support_mean
 
-        context = self.encoder(x_support)
-        if self.low_rank_dim is None:
+        if self.encoder_type == "attention":
+            if self.query_decoder is None or self.output_bias is None:
+                raise RuntimeError("attention encoder_type requires query_decoder and output_bias")
+            t_enc0 = _synchronized_perf_counter(features.device)
+            context = self.encoder(x_support)
+            t_enc1 = _synchronized_perf_counter(features.device)
+
+            t_dec0 = _synchronized_perf_counter(features.device)
+            W = self.query_decoder(context)
+            t_dec1 = _synchronized_perf_counter(features.device)
+            b = self.output_bias
+            encoder_ms = float((t_enc1 - t_enc0) * 1000.0)
+            decoder_ms = float((t_dec1 - t_dec0) * 1000.0)
+            eigendecomp_ms = float(getattr(self.encoder, "last_profile", {}).get("eigendecomp_ms", 0.0))
+            self.last_profile = {
+                "eigendecomp_ms": eigendecomp_ms,
+                "encoder_ms": encoder_ms,
+                "decoder_ms": decoder_ms,
+                "hypernetwork_forward_ms": float(encoder_ms + decoder_ms),
+            }
+        elif self.low_rank_dim is None:
+            if self.weight_generator is None or self.bias_generator is None:
+                raise RuntimeError("mlp encoder_type requires weight_generator and bias_generator")
+            context = self.encoder(x_support)
             weights_flat = self.weight_generator(context)
             W = weights_flat.view(self.input_dim, self.output_dim)
+            b = self.bias_generator(context).squeeze(0)
+            self.last_profile = {}
         else:
+            if self.a_generator is None or self.b_generator is None or self.bias_generator is None:
+                raise RuntimeError(
+                    "mlp low-rank mode requires a_generator, b_generator, and bias_generator"
+                )
+            context = self.encoder(x_support)
             A = self.a_generator(context).view(self.input_dim, self.low_rank_dim)
             B = self.b_generator(context).view(self.low_rank_dim, self.output_dim)
             W = A @ B
-        b = self.bias_generator(context).squeeze(0)
+            b = self.bias_generator(context).squeeze(0)
+            self.last_profile = {}
 
-        return x_target @ W + b
+        projected = x_target @ W + b
+        if return_projection_matrix:
+            return projected, W
+        return projected
 
 
 class VanillaStatsHypernetworkAdapter(nn.Module):
@@ -297,6 +362,7 @@ class VanillaStatsHypernetworkAdapter(nn.Module):
         eps: float = 1e-6,
         low_rank_dim: int | None = None,
         tiny_weight_std: float = 1e-4,
+        use_random_projection_init: bool = True,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -316,6 +382,7 @@ class VanillaStatsHypernetworkAdapter(nn.Module):
         self.output_dim = int(output_dim)
         self.eps = float(eps)
         self.low_rank_dim = int(low_rank_dim) if low_rank_dim is not None else None
+        self.use_random_projection_init = bool(use_random_projection_init)
 
         context_dim = 2 * self.input_dim
         self.context_mlp = nn.Sequential(
@@ -335,26 +402,33 @@ class VanillaStatsHypernetworkAdapter(nn.Module):
             self.a_generator = nn.Linear(int(context_hidden_dim), self.input_dim * self.low_rank_dim)
             self.b_generator = nn.Linear(int(context_hidden_dim), self.low_rank_dim * self.output_dim)
         self.bias_generator = nn.Linear(int(context_hidden_dim), self.output_dim)
-        if self.low_rank_dim is None:
-            _init_generators_as_random_projection(
-                weight_generator=self.weight_generator,
-                bias_generator=self.bias_generator,
-                input_dim=self.input_dim,
-                output_dim=self.output_dim,
-                tiny_weight_std=tiny_weight_std,
-            )
-        else:
-            _init_low_rank_generators_as_random_projection(
-                a_generator=self.a_generator,
-                b_generator=self.b_generator,
-                bias_generator=self.bias_generator,
-                input_dim=self.input_dim,
-                output_dim=self.output_dim,
-                rank=self.low_rank_dim,
-                tiny_weight_std=tiny_weight_std,
-            )
+        if self.use_random_projection_init:
+            if self.low_rank_dim is None:
+                _init_generators_as_random_projection(
+                    weight_generator=self.weight_generator,
+                    bias_generator=self.bias_generator,
+                    input_dim=self.input_dim,
+                    output_dim=self.output_dim,
+                    tiny_weight_std=tiny_weight_std,
+                )
+            else:
+                _init_low_rank_generators_as_random_projection(
+                    a_generator=self.a_generator,
+                    b_generator=self.b_generator,
+                    bias_generator=self.bias_generator,
+                    input_dim=self.input_dim,
+                    output_dim=self.output_dim,
+                    rank=self.low_rank_dim,
+                    tiny_weight_std=tiny_weight_std,
+                )
 
-    def forward(self, *, features: torch.Tensor, support_indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        *,
+        features: torch.Tensor,
+        support_indices: torch.Tensor,
+        return_projection_matrix: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project all episode rows using support-conditioned generated weights."""
         if features.ndim != 2:
             raise ValueError(f"Expected features shape [N, D], got {tuple(features.shape)}")
@@ -385,4 +459,7 @@ class VanillaStatsHypernetworkAdapter(nn.Module):
         b = self.bias_generator(context).squeeze(0)
 
         x_target = features - support_mean
-        return x_target @ W + b
+        projected = x_target @ W + b
+        if return_projection_matrix:
+            return projected, W
+        return projected

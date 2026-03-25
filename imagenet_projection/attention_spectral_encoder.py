@@ -1,5 +1,12 @@
 import torch
 import torch.nn as nn
+import time
+
+
+def _synchronized_perf_counter(device: torch.device) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
 
 
 class AttentionSpectralEncoder(nn.Module):
@@ -32,13 +39,10 @@ class AttentionSpectralEncoder(nn.Module):
         self.top_k = int(top_k)
         self.context_hidden_dim = int(embed_dim)
 
-        # 1. Project (Singular Value + Vector) down to the embedding dimension
-        self.token_projection = nn.Linear(self.input_dim + 1, self.context_hidden_dim)
+        # 1. Project singular-value-weighted vectors to embedding dimension.
+        self.token_projection = nn.Linear(self.input_dim, self.context_hidden_dim)
 
-        # 2. Learned positional embeddings so the model knows component rank
-        self.pos_embed = nn.Parameter(torch.randn(1, self.top_k, self.context_hidden_dim) * 0.02)
-
-        # 3. Lightweight Transformer
+        # 2. Lightweight Transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.context_hidden_dim,
             nhead=int(num_heads),
@@ -48,9 +52,10 @@ class AttentionSpectralEncoder(nn.Module):
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
+        self.last_profile: dict[str, float] = {}
 
     def forward(self, x_support: torch.Tensor) -> torch.Tensor:
-        """Encode one support matrix [Ns, D] into context [1, embed_dim]."""
+        """Encode one support matrix [Ns, D] into token memory [1, top_k, embed_dim]."""
         if x_support.ndim != 2:
             raise ValueError(f"Expected x_support shape [Ns, D], got {tuple(x_support.shape)}")
         if x_support.shape[0] == 0:
@@ -62,8 +67,13 @@ class AttentionSpectralEncoder(nn.Module):
 
         x_centered = x_support - x_support.mean(dim=0, keepdim=True)
 
-        # Calculate SVD
+        # Calculate SVD (eigendecomposition-equivalent spectral step)
+        t0 = _synchronized_perf_counter(x_support.device)
         _, svals, vh = torch.linalg.svd(x_centered, full_matrices=False)
+        t1 = _synchronized_perf_counter(x_support.device)
+        self.last_profile = {
+            "eigendecomp_ms": float((t1 - t0) * 1000.0),
+        }
 
         # --- DETERMINISTIC SIGN CORRECTION ---
         # Find the index of the max absolute value in each singular vector
@@ -81,6 +91,11 @@ class AttentionSpectralEncoder(nn.Module):
         top_s = svals[:k_actual]
         top_vh = vh[:k_actual, :]
 
+        # Singular value injection: normalize values and scale each component vector.
+        s_max = torch.max(top_s).clamp_min(1e-8)
+        s_normalized = top_s / s_max
+        top_vh = top_vh * s_normalized.unsqueeze(1)
+
         if k_actual < self.top_k:
             pad_s = torch.zeros(self.top_k - k_actual, device=x_support.device, dtype=x_support.dtype)
             pad_vh = torch.zeros(
@@ -92,18 +107,11 @@ class AttentionSpectralEncoder(nn.Module):
             top_s = torch.cat([top_s, pad_s], dim=0)
             top_vh = torch.cat([top_vh, pad_vh], dim=0)
 
-        # Combine Singular Values and Vectors: Shape [top_k, input_dim + 1]
-        tokens = torch.cat([top_s.unsqueeze(1), top_vh], dim=1)
-
-        # Add a batch dimension: [1, top_k, input_dim + 1]
-        tokens = tokens.unsqueeze(0)
+        # Add a batch dimension: [1, top_k, input_dim]
+        tokens = top_vh.unsqueeze(0)
 
         # Pass through architecture
         x = self.token_projection(tokens)
-        x = x + self.pos_embed
         x = self.transformer(x)
 
-        # Mean Pooling across the top_k components to get final context
-        context = x.mean(dim=1)
-
-        return context
+        return x

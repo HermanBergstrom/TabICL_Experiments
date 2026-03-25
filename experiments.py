@@ -353,6 +353,21 @@ def _maybe_index(arr: np.ndarray | None, idx: np.ndarray) -> np.ndarray | None:
 	return None if arr is None else arr[idx]
 
 
+def _format_class_balance(y: np.ndarray) -> str:
+	"""Return a readable class-count + percentage summary."""
+	y = np.asarray(y).reshape(-1)
+	if y.size == 0:
+		return "empty"
+	classes, counts = np.unique(y, return_counts=True)
+	total = int(y.size)
+	parts: list[str] = []
+	for cls, count in zip(classes, counts):
+		if isinstance(cls, np.generic):
+			cls = cls.item()
+		parts.append(f"{cls}:{int(count)} ({(int(count) / total) * 100:.1f}%)")
+	return ", ".join(parts)
+
+
 def _balanced_classification_indices(
 	y: np.ndarray,
 	seed: int,
@@ -1089,6 +1104,9 @@ def run_experiment(
 	print(f"  data_root  : {data_root}")
 	if task == "classification":
 		print(f"  tabular    : {X_tab_full['train'].shape}  classes={len(np.unique(y_full['train']))}")
+		print(f"  class_bal  : train[{_format_class_balance(y_full['train'])}]")
+		print(f"               val[{_format_class_balance(y_val)}]")
+		print(f"               test[{_format_class_balance(y_test)}]")
 	else:
 		print(f"  tabular    : {X_tab_full['train'].shape}  task=regression")
 	if X_img_full["train"] is not None:
@@ -1169,6 +1187,8 @@ def run_experiment(
 
 		label = "all" if train_size is None else str(train_size)
 		print(f"\n=== Train size: {label} | actual: {len(y_train)} ===")
+		if task == "classification":
+			print(f"[info] Sampled train class balance: {_format_class_balance(y_train)}")
 
 		X_rep_train: np.ndarray | None = None
 		X_rep_val: np.ndarray | None = None

@@ -1,6 +1,6 @@
 """Reusable components for ImageNet projection experiments."""
 
-from .checkpoints import (
+from .save_checkpoints import (
 	extract_projection_state_dict,
 	infer_projection_head_from_state_dict,
 	load_projection_head_checkpoint,

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from finetune_projection_head import ProjectionHead
-from .hypernetwork_blueprint import SpectralHypernetworkAdapter, VanillaStatsHypernetworkAdapter
+from .hypernetworks import SpectralHypernetworkAdapter, VanillaStatsHypernetworkAdapter
 
 
 def transform_projection_inputs(
@@ -52,7 +52,8 @@ def project_episode_features(
 	features: torch.Tensor,
 	support_indices: torch.Tensor,
 	zca_epsilon: float,
-) -> torch.Tensor:
+	return_projection_matrix: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
 	"""Project all rows in an episode for a given projection method."""
 	if method in {"projection_head", "zca_projection_head"}:
 		X_proj_in = transform_projection_inputs(
@@ -61,21 +62,34 @@ def project_episode_features(
 			support_indices=support_indices,
 			zca_epsilon=zca_epsilon,
 		)
-		return module(X_proj_in)
+		projected = module(X_proj_in)
+		if return_projection_matrix:
+			return projected, None
+		return projected
 
 	if method == "spectral_hypernetwork":
 		if not isinstance(module, SpectralHypernetworkAdapter):
 			raise TypeError(
 				"spectral_hypernetwork requires SpectralHypernetworkAdapter module"
 			)
-		return module(features=features, support_indices=support_indices)
+		projected = module(
+			features=features,
+			support_indices=support_indices,
+			return_projection_matrix=return_projection_matrix,
+		)
+		return projected
 
 	if method == "vanilla_hypernetwork":
 		if not isinstance(module, VanillaStatsHypernetworkAdapter):
 			raise TypeError(
 				"vanilla_hypernetwork requires VanillaStatsHypernetworkAdapter module"
 			)
-		return module(features=features, support_indices=support_indices)
+		projected = module(
+			features=features,
+			support_indices=support_indices,
+			return_projection_matrix=return_projection_matrix,
+		)
+		return projected
 
 	raise ValueError(
 		f"Unsupported projection method: {method}. "
@@ -131,6 +145,7 @@ def build_projection_module(
 	hyper_encoder_type: str,
 	hyper_attn_heads: int,
 	hyper_attn_layers: int,
+	use_random_projection_init: bool,
 	device: torch.device,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
 	"""Build a projection module and return (module, metadata)."""
@@ -160,6 +175,7 @@ def build_projection_module(
 			encoder_type=str(hyper_encoder_type),
 			attention_num_heads=int(hyper_attn_heads),
 			attention_num_layers=int(hyper_attn_layers),
+			use_random_projection_init=bool(use_random_projection_init),
 		).to(device)
 	elif method == "vanilla_hypernetwork":
 		actual_output_dim = int(output_dim if output_dim is not None else input_dim)
@@ -167,6 +183,7 @@ def build_projection_module(
 			input_dim=int(input_dim),
 			output_dim=actual_output_dim,
 			context_hidden_dim=int(hidden_dim),
+			use_random_projection_init=bool(use_random_projection_init),
 		).to(device)
 	else:
 		module = ProjectionHead(
@@ -195,6 +212,7 @@ def build_projection_module(
 		"hyper_encoder_type": str(hyper_encoder_type),
 		"hyper_attn_heads": int(hyper_attn_heads),
 		"hyper_attn_layers": int(hyper_attn_layers),
+		"hyper_use_random_projection_init": bool(use_random_projection_init),
 	}
 	return module, meta
 
