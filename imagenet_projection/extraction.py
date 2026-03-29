@@ -24,9 +24,14 @@ class IndexedImageFolder(Dataset[dict[str, Any]]):
 	def __len__(self) -> int:
 		return len(self.base)
 
-	def __getitem__(self, idx: int) -> dict[str, Any]:
-		image, target = self.base[idx]
+	def __getitem__(self, idx: int) -> dict[str, Any] | None:
 		path, _class_id = self.base.samples[idx]
+		try:
+			image, target = self.base[idx]
+		except Exception as e:
+			print(f"\n[warning] Skipping corrupted/unreadable image {path}: {e}")
+			return None
+
 		return {
 			"image": image,
 			"target": int(target),
@@ -39,7 +44,10 @@ class IndexedImageFolder(Dataset[dict[str, Any]]):
 		return dict(self.base.class_to_idx)
 
 
-def collate_indexed(batch: list[dict[str, Any]]) -> dict[str, Any]:
+def collate_indexed(batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+	batch = [item for item in batch if item is not None]
+	if not batch:
+		return None
 	images = torch.stack([item["image"] for item in batch], dim=0)
 	targets = torch.tensor([item["target"] for item in batch], dtype=torch.long)
 	indices = torch.tensor([item["index"] for item in batch], dtype=torch.long)
@@ -213,7 +221,7 @@ def _flush_shard(
 
 	start_idx = int(indices.min().item()) if indices.numel() > 0 else -1
 	end_idx = int(indices.max().item()) if indices.numel() > 0 else -1
-	manifest["processed_samples"] = int(manifest["processed_samples"]) + int(features.shape[0])
+	manifest["processed_samples"] = max(int(manifest["processed_samples"]), end_idx + 1)
 	manifest["next_shard_id"] = shard_id + 1
 	manifest["shards"].append(
 		{
@@ -229,7 +237,10 @@ def _flush_shard(
 
 
 def extract_split(config: ExtractConfig, split: str, model: torch.nn.Module, device: torch.device) -> None:
-	split_dir = config.data_dir / split
+	if split == "all":
+		split_dir = config.data_dir
+	else:
+		split_dir = config.data_dir / split
 	if not split_dir.exists():
 		raise FileNotFoundError(f"ImageNet split directory not found: {split_dir}")
 
@@ -335,6 +346,8 @@ def extract_split(config: ExtractConfig, split: str, model: torch.nn.Module, dev
 
 	with torch.inference_mode():
 		for batch in tqdm(loader, desc=f"split={split}"):
+			if batch is None:
+				continue
 			images = batch["images"].to(device, non_blocking=True)
 			targets = batch["targets"].cpu().to(torch.long)
 			indices = batch["indices"].cpu().to(torch.long)
@@ -355,6 +368,9 @@ def extract_split(config: ExtractConfig, split: str, model: torch.nn.Module, dev
 				flush_ready_shards(force=False)
 
 	flush_ready_shards(force=True)
+
+	manifest["processed_samples"] = len(full_dataset)
+	_write_json(_manifest_path(config.output_dir, split), manifest)
 
 	print(
 		f"[done] split={split} processed={manifest['processed_samples']} "

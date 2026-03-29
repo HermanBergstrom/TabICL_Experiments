@@ -66,6 +66,7 @@ class HardNegativeClassSampler:
 		class_centroids: torch.Tensor,
 		device: torch.device | str = "cpu",
 		temperature: float = 0.1,
+		seed: int = 0,
 	) -> None:
 		"""Initialize with class centroids and precompute similarity matrix.
 		
@@ -78,6 +79,8 @@ class HardNegativeClassSampler:
 		self.device = torch.device(device) if isinstance(device, str) else device
 		self.temperature = temperature
 		self.num_classes = class_centroids.shape[0]
+		self.generator = torch.Generator(device=self.device.type)
+		self.generator.manual_seed(int(seed))
 
 		# L2-normalize centroids for cosine similarity computation
 		centroids_norm = F.normalize(class_centroids.to(self.device), p=2, dim=1)
@@ -116,14 +119,20 @@ class HardNegativeClassSampler:
 			)
 
 		# 50/50 coin flip: uniform or hard sampling
-		if torch.rand(1, device=self.device).item() > hard_prob:
-			return torch.randperm(self.num_classes, device=self.device)[:k_classes]
+		if torch.rand(1, device=self.device, generator=self.generator).item() > hard_prob:
+			return torch.randperm(self.num_classes, device=self.device, generator=self.generator)[:k_classes]
 
 		# Hard negative sampling: iteratively select difficult classes
 		selected = torch.zeros(k_classes, dtype=torch.long, device=self.device)
 
 		# Step 1: Pick the first class uniformly at random
-		selected[0] = torch.randint(0, self.num_classes, (1,), device=self.device)
+		selected[0] = torch.randint(
+			0,
+			self.num_classes,
+			(1,),
+			device=self.device,
+			generator=self.generator,
+		)
 
 		# Track which classes have been selected
 		available_mask = torch.ones(self.num_classes, dtype=torch.bool, device=self.device)
@@ -146,7 +155,7 @@ class HardNegativeClassSampler:
 			probs = F.softmax(logits / self.temperature, dim=0)
 
 			# Sample the next class according to similarity-based probabilities
-			next_class = torch.multinomial(probs, num_samples=1)[0]
+			next_class = torch.multinomial(probs, num_samples=1, generator=self.generator)[0]
 			selected[i] = next_class
 
 			# Update: mark this class as selected
@@ -302,6 +311,7 @@ class ShardedEmbeddingSampler:
 				class_centroids=centroids,
 				device=hard_sampling_device,
 				temperature=hard_sampling_temperature,
+				seed=seed,
 			)
 
 	def _preload_all_data(self) -> tuple[torch.Tensor, dict[int, list[int]]]:

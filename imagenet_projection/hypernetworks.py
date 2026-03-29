@@ -175,6 +175,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         encoder_type: str = "mlp",
         attention_num_heads: int = 4,
         attention_num_layers: int = 2,
+        attention_use_positional_embeddings: bool = False,
         low_rank_dim: int | None = None,
         tiny_weight_std: float = 1e-4,
         covariance_jitter: float = 1e-6,
@@ -210,6 +211,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         self.encoder_type = str(encoder_type)
         self.low_rank_dim = int(low_rank_dim) if low_rank_dim is not None else None
         self.use_random_projection_init = bool(use_random_projection_init)
+        self.attention_use_positional_embeddings = bool(attention_use_positional_embeddings)
         self.query_decoder: ParallelQueryDecoder | None = None
         self.output_bias: nn.Parameter | None = None
         self.last_profile: dict[str, float] = {}
@@ -228,6 +230,7 @@ class SpectralHypernetworkAdapter(nn.Module):
                 embed_dim=int(context_hidden_dim),
                 num_heads=int(attention_num_heads),
                 num_layers=int(attention_num_layers),
+                use_positional_embeddings=self.attention_use_positional_embeddings,
             )
             self.query_decoder = ParallelQueryDecoder(
                 embed_dim=int(context_hidden_dim),
@@ -301,6 +304,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         x_target = features - support_mean
 
         if self.encoder_type == "attention":
+            #print("Using attention-based spectral encoder and decoder")
             if self.query_decoder is None or self.output_bias is None:
                 raise RuntimeError("attention encoder_type requires query_decoder and output_bias")
             t_enc0 = _synchronized_perf_counter(features.device)
@@ -310,6 +314,8 @@ class SpectralHypernetworkAdapter(nn.Module):
             t_dec0 = _synchronized_perf_counter(features.device)
             W = self.query_decoder(context)
             t_dec1 = _synchronized_perf_counter(features.device)
+            #print("Calculated W")
+            #print("X_support shape:", x_support.shape)
             b = self.output_bias
             encoder_ms = float((t_enc1 - t_enc0) * 1000.0)
             decoder_ms = float((t_dec1 - t_dec0) * 1000.0)
@@ -339,7 +345,12 @@ class SpectralHypernetworkAdapter(nn.Module):
             W = A @ B
             b = self.bias_generator(context).squeeze(0)
             self.last_profile = {}
-
+        #print("W norm:", W.norm().item())
+        #Measure orthogonality of W
+        #WtW = W.T @ W
+        #identity = torch.eye(WtW.shape[0], device=WtW.device, dtype=WtW.dtype)
+        #orthogonality_error = (WtW - identity).norm().item()
+        #print("W orthogonality error (||W^T W - I||):", orthogonality_error)
         projected = x_target @ W + b
         if return_projection_matrix:
             return projected, W

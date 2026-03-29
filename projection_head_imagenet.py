@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from finetune_projection_head import FrozenTabICLConfig
 from imagenet_projection.save_checkpoints import save_projection_checkpoint
@@ -37,6 +38,67 @@ def _sanitize_run_name(raw_name: str | None) -> str:
     return cleaned or "run"
 
 
+def _resolve_checkpoint_file(path: Path) -> Path:
+    """Resolve a checkpoint reference to a concrete file path."""
+    if path.is_dir():
+        return path / "latest.pt"
+    return path
+
+
+def _collect_explicit_cli_dests(parser: argparse.ArgumentParser) -> set[str]:
+    """Collect argparse destination names that were explicitly set via CLI flags."""
+    option_to_dest: dict[str, str] = {}
+    for action in parser._actions:
+        for option in action.option_strings:
+            option_to_dest[option] = action.dest
+
+    explicit: set[str] = set()
+    for token in sys.argv[1:]:
+        if not token.startswith("--"):
+            continue
+        option = token.split("=", maxsplit=1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            explicit.add(dest)
+    return explicit
+
+
+def _apply_stored_train_args(
+    *,
+    args: argparse.Namespace,
+    stored_args: dict[str, object],
+    explicit_dests: set[str],
+) -> None:
+    """Apply stored args into argparse namespace unless explicitly overridden."""
+    path_fields = {
+        "data_dir",
+        "output_dir",
+        "repo_dir",
+        "weights",
+        "sample_output_dir",
+        "tabicl_model_path",
+        "checkpoint_dir",
+        "train_output",
+        "resume_from_checkpoint",
+    }
+    protected_fields = {
+        "mode",
+        "resume_training",
+        "resume_from_checkpoint",
+        "checkpoint_dir",
+    }
+
+    for key, value in stored_args.items():
+        if not hasattr(args, key):
+            continue
+        if key in explicit_dests or key in protected_fields:
+            continue
+        if key in path_fields:
+            setattr(args, key, Path(value) if value is not None else None)
+        else:
+            setattr(args, key, value)
+
+
 def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     parser = argparse.ArgumentParser(
         description="Extract full-ImageNet DINOv3 embeddings and train projection methods.",
@@ -45,7 +107,7 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         "--mode",
         type=str,
         choices=["extract", "sample-loop", "train-loop"],
-        default="extract",
+        default="train-loop",
         help="Run feature extraction, class-first dataset sampling loop, or training loop.",
     )
     parser.add_argument(
@@ -63,9 +125,9 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     parser.add_argument(
         "--split",
         type=str,
-        choices=["train", "val", "both"],
+        choices=["train", "val", "both", "all"],
         default="both",
-        help="Which ImageNet split to process.",
+        help="Which ImageNet split to process ('all' uses data-dir directly with no split subfolders).",
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -196,6 +258,11 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         help="Number of transformer encoder layers when --hyper-encoder-type attention.",
     )
     parser.add_argument(
+        "--hyper-attn-use-pos-embed",
+        action="store_true",
+        help="Enable learned positional embeddings in attention spectral encoder.",
+    )
+    parser.add_argument(
         "--disable-random-projection-init",
         action="store_true",
         help=(
@@ -219,7 +286,7 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         ),
     )
     parser.add_argument("--log-every", type=int, default=500)
-    parser.add_argument("--val-split", type=str, choices=["none", "train", "val"], default="val")
+    parser.add_argument("--val-split", type=str, choices=["none", "train", "val", "all"], default="val")
     parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument(
@@ -240,6 +307,15 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     parser.add_argument("--wandb-project", type=str, default="imagenet-projection")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument(
+        "--wandb-resume-id",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit W&B run id to resume. Overrides checkpoint-stored run id "
+            "when provided."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-dir",
         type=Path,
         default=Path("model_weights/hypernetwork_checkpoints"),
@@ -255,6 +331,16 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         help="Resume training loop state from checkpoint-dir/latest.pt if present.",
     )
     parser.add_argument(
+        "--resume-from-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Resume using a checkpoint reference (either latest.pt or its run directory). "
+            "When available, stored training args from the checkpoint are used unless "
+            "you explicitly override them on the CLI."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-interval-steps",
         type=int,
         default=500,
@@ -262,7 +348,46 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     )
     parser.add_argument("--train-output", type=Path, default=None, help="Optional path to save trained head checkpoint (.pt).")
 
+    explicit_dests = _collect_explicit_cli_dests(parser)
     args = parser.parse_args()
+
+    if args.resume_from_checkpoint is not None:
+        args.resume_training = True
+        resolved_resume_ckpt = _resolve_checkpoint_file(args.resume_from_checkpoint)
+        args.checkpoint_dir = resolved_resume_ckpt.parent
+
+    if args.mode == "train-loop" and args.resume_training:
+        resume_checkpoint_path = _resolve_checkpoint_file(args.checkpoint_dir)
+        if not resume_checkpoint_path.exists():
+            raise ValueError(
+                "Resume requested but checkpoint does not exist at "
+                f"{resume_checkpoint_path}"
+            )
+        checkpoint_obj = torch.load(resume_checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint_obj, dict):
+            raise ValueError(f"Checkpoint at {resume_checkpoint_path} must be a dict")
+        stored_train_args = checkpoint_obj.get("effective_train_args")
+        if not isinstance(stored_train_args, dict):
+            run_metadata = checkpoint_obj.get("run_metadata")
+            if isinstance(run_metadata, dict):
+                nested_args = run_metadata.get("effective_train_args")
+                if isinstance(nested_args, dict):
+                    stored_train_args = nested_args
+        if isinstance(stored_train_args, dict):
+            _apply_stored_train_args(
+                args=args,
+                stored_args=stored_train_args,
+                explicit_dests=explicit_dests,
+            )
+            print(
+                f"[info] Loaded stored train args from checkpoint: {resume_checkpoint_path} "
+                f"(explicit CLI overrides: {len(explicit_dests)})"
+            )
+        else:
+            print(
+                f"[info] Checkpoint has no stored args (legacy checkpoint): {resume_checkpoint_path}. "
+                "Using CLI/default arguments."
+            )
 
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
@@ -375,7 +500,7 @@ def main() -> None:
         return
 
     if args.split == "both":
-        raise ValueError("--split must be train or val when --mode sample-loop or --mode train-loop")
+        raise ValueError("--split must be a single split (e.g. train, val, all) when --mode sample-loop or --mode train-loop")
 
     sampling_cfg = SamplingConfig(
         output_dir=config.output_dir,
@@ -435,6 +560,12 @@ def main() -> None:
             checkpoint_dir = checkpoint_dir / f"{run_name_slug}_{start_stamp}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"[info] Checkpoint directory: {checkpoint_dir}")
+
+    effective_train_args = {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+    }
+    effective_train_args["checkpoint_dir"] = str(checkpoint_dir)
 
     tabicl_cfg = FrozenTabICLConfig(
         n_models=1,
@@ -502,15 +633,18 @@ def main() -> None:
         hyper_encoder_type=args.hyper_encoder_type,
         hyper_attn_heads=args.hyper_attn_heads,
         hyper_attn_layers=args.hyper_attn_layers,
+        hyper_attn_use_pos_embed=bool(args.hyper_attn_use_pos_embed),
         use_random_projection_init=not bool(args.disable_random_projection_init),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ortho_lambda=args.ortho_lambda,
         enable_wandb=not bool(args.disable_wandb),
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        wandb_resume_id=args.wandb_resume_id,
         checkpoint_dir=checkpoint_dir,
         resume_training=bool(args.resume_training),
         checkpoint_interval_steps=args.checkpoint_interval_steps,
+        effective_train_args=effective_train_args,
     )
 
     if args.train_output is not None:
@@ -533,6 +667,7 @@ def main() -> None:
                 "hyper_encoder_type": projection_meta.get("hyper_encoder_type"),
                 "hyper_attn_heads": projection_meta.get("hyper_attn_heads"),
                 "hyper_attn_layers": projection_meta.get("hyper_attn_layers"),
+                "hyper_attn_use_pos_embed": projection_meta.get("hyper_attn_use_pos_embed"),
                 "hyper_use_random_projection_init": projection_meta.get("hyper_use_random_projection_init"),
             },
         )

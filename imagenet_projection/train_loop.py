@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -54,15 +55,18 @@ def train_projection_head_with_sampler(
 	hyper_encoder_type: str = "mlp",
 	hyper_attn_heads: int = 4,
 	hyper_attn_layers: int = 2,
+	hyper_attn_use_pos_embed: bool = False,
 	use_random_projection_init: bool = True,
 	gradient_accumulation_steps: int = 1,
 	ortho_lambda: float = 0.01,
 	enable_wandb: bool = True,
 	wandb_project: str = "imagenet-projection",
 	wandb_run_name: str | None = None,
+	wandb_resume_id: str | None = None,
 	checkpoint_dir: str | Path = "model_weights/hypernetwork_checkpoints",
 	resume_training: bool = False,
 	checkpoint_interval_steps: int = 50,
+	effective_train_args: dict[str, Any] | None = None,
 ) -> tuple[torch.nn.Module, dict[str, list[float]], dict[str, Any]]:
 	"""Train projection module with one sampled dataset per optimization step."""
 	if num_steps <= 0:
@@ -89,15 +93,43 @@ def train_projection_head_with_sampler(
 		raise ValueError("checkpoint_interval_steps must be > 0")
 
 	device_t = torch.device(device)
+	checkpoint_dir_path = Path(checkpoint_dir)
+	checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
+	latest_checkpoint_path = checkpoint_dir_path / "latest.pt"
+	best_heldout_checkpoint_path = checkpoint_dir_path / "best_heldout.pt"
+
+	resume_checkpoint: dict[str, Any] | None = None
+	resume_wandb_id: str | None = wandb_resume_id
+	if resume_training and latest_checkpoint_path.exists():
+		loaded_checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
+		if not isinstance(loaded_checkpoint, dict):
+			raise ValueError(f"Invalid checkpoint format at {latest_checkpoint_path}")
+		resume_checkpoint = loaded_checkpoint
+		if resume_wandb_id is None:
+			run_metadata = loaded_checkpoint.get("run_metadata")
+			if isinstance(run_metadata, dict):
+				wandb_id = run_metadata.get("wandb_run_id")
+				if isinstance(wandb_id, str) and len(wandb_id) > 0:
+					resume_wandb_id = wandb_id
+		if resume_wandb_id is None:
+			legacy_wandb_id = loaded_checkpoint.get("wandb_run_id")
+			if isinstance(legacy_wandb_id, str) and len(legacy_wandb_id) > 0:
+				resume_wandb_id = legacy_wandb_id
 
 	if enable_wandb and wandb is None:
 		print("[warn] wandb is not installed; continuing without W&B logging")
 		enable_wandb = False
+	wandb_run_id: str | None = None
+	if enable_wandb and resume_training and resume_wandb_id is None:
+		print(
+			"[warn] Resume requested but no W&B run id was found in checkpoint metadata. "
+			"A new W&B run will be created unless --wandb-resume-id is provided."
+		)
 	if enable_wandb and wandb is not None and wandb.run is None:
-		wandb.init(
-			project=wandb_project,
-			name=wandb_run_name,
-			config={
+		wandb_init_kwargs: dict[str, Any] = {
+			"project": wandb_project,
+			"name": wandb_run_name,
+			"config": {
 				"num_steps": int(num_steps),
 				"learning_rate": float(learning_rate),
 				"weight_decay": float(weight_decay),
@@ -116,6 +148,7 @@ def train_projection_head_with_sampler(
 				"hyper_encoder_type": str(hyper_encoder_type),
 				"hyper_attn_heads": int(hyper_attn_heads),
 				"hyper_attn_layers": int(hyper_attn_layers),
+				"hyper_attn_use_pos_embed": bool(hyper_attn_use_pos_embed),
 				"use_random_projection_init": bool(use_random_projection_init),
 				"sampling_min_dataset_size": int(sampling_config.min_dataset_size),
 				"sampling_max_dataset_size": int(sampling_config.max_dataset_size),
@@ -129,7 +162,19 @@ def train_projection_head_with_sampler(
 				"hard_sampling_prob": float(sampling_config.hard_sampling_prob),
 				"hard_sampling_device": str(sampling_config.hard_sampling_device),
 			},
-		)
+		}
+		if resume_wandb_id is not None:
+			wandb_init_kwargs["id"] = resume_wandb_id
+			wandb_init_kwargs["resume"] = "must"
+		wandb.init(**wandb_init_kwargs)
+		wandb_run_id = str(wandb.run.id) if wandb.run is not None else resume_wandb_id
+		if resume_wandb_id is not None and wandb_run_id != resume_wandb_id:
+			print(
+				"[warn] W&B resumed with a different run id than checkpoint metadata: "
+				f"requested={resume_wandb_id} actual={wandb_run_id}"
+			)
+	elif enable_wandb and wandb is not None and wandb.run is not None:
+		wandb_run_id = str(wandb.run.id)
 
 	def _calculate_orthogonal_penalty(W: torch.Tensor | None) -> torch.Tensor:
 		if W is None:
@@ -333,6 +378,7 @@ def train_projection_head_with_sampler(
 		hyper_encoder_type=hyper_encoder_type,
 		hyper_attn_heads=hyper_attn_heads,
 		hyper_attn_layers=hyper_attn_layers,
+		hyper_attn_use_pos_embed=hyper_attn_use_pos_embed,
 		use_random_projection_init=use_random_projection_init,
 		device=device_t,
 	)
@@ -416,11 +462,6 @@ def train_projection_head_with_sampler(
 	optimizer_step_count = 0
 	start_step = 1
 
-	checkpoint_dir_path = Path(checkpoint_dir)
-	checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
-	latest_checkpoint_path = checkpoint_dir_path / "latest.pt"
-	best_heldout_checkpoint_path = checkpoint_dir_path / "best_heldout.pt"
-
 	history: dict[str, list[float]] = {
 		"loss": [],
 		"ce_loss": [],
@@ -460,6 +501,36 @@ def train_projection_head_with_sampler(
 	best_heldout_loss = float("inf")
 
 	def _checkpoint_payload(*, step_value: int, which: str) -> dict[str, Any]:
+		rng_state_payload: dict[str, Any] = {
+			"sampler_rng": sampler.rng.bit_generator.state,
+			"split_rng": split_rng.bit_generator.state,
+			"python_random": random.getstate(),
+			"torch_cpu": torch.get_rng_state().cpu(),
+		}
+		if val_sampler is not None:
+			rng_state_payload["val_sampler_rng"] = val_sampler.rng.bit_generator.state
+		if split_rng_val is not None:
+			rng_state_payload["split_rng_val"] = split_rng_val.bit_generator.state
+		if val_heldout_sampler is not None:
+			rng_state_payload["val_heldout_sampler_rng"] = val_heldout_sampler.rng.bit_generator.state
+		if split_rng_heldout is not None:
+			rng_state_payload["split_rng_heldout"] = split_rng_heldout.bit_generator.state
+		if torch.cuda.is_available():
+			rng_state_payload["torch_cuda_all"] = [state.cpu() for state in torch.cuda.get_rng_state_all()]
+		if sampler.hard_sampler is not None:
+			rng_state_payload["sampler_hard_rng"] = sampler.hard_sampler.generator.get_state().cpu()
+		if val_sampler is not None and val_sampler.hard_sampler is not None:
+			rng_state_payload["val_sampler_hard_rng"] = val_sampler.hard_sampler.generator.get_state().cpu()
+		if val_heldout_sampler is not None and val_heldout_sampler.hard_sampler is not None:
+			rng_state_payload["val_heldout_sampler_hard_rng"] = val_heldout_sampler.hard_sampler.generator.get_state().cpu()
+
+		run_metadata: dict[str, Any] = {
+			"effective_train_args": dict(effective_train_args or {}),
+			"wandb_project": str(wandb_project),
+			"wandb_run_name": str(wandb_run_name) if wandb_run_name is not None else None,
+			"wandb_run_id": wandb_run_id,
+			"checkpoint_dir": str(checkpoint_dir_path),
+		}
 		return {
 			"which": which,
 			"step": int(step_value),
@@ -475,10 +546,15 @@ def train_projection_head_with_sampler(
 			"best_val_loss": float(best_val_loss),
 			"best_heldout_acc": float(best_heldout_acc),
 			"best_heldout_loss": float(best_heldout_loss),
+			"effective_train_args": dict(effective_train_args or {}),
+			"rng_state": rng_state_payload,
+			"run_metadata": run_metadata,
 		}
 
 	if resume_training and latest_checkpoint_path.exists():
-		checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
+		checkpoint = resume_checkpoint
+		if checkpoint is None:
+			checkpoint = torch.load(latest_checkpoint_path, map_location="cpu", weights_only=False)
 		if not isinstance(checkpoint, dict):
 			raise ValueError(f"Invalid checkpoint format at {latest_checkpoint_path}")
 		head_state_dict = checkpoint.get("head_state_dict")
@@ -504,6 +580,59 @@ def train_projection_head_with_sampler(
 		best_heldout_loss = float(checkpoint.get("best_heldout_loss", best_heldout_loss))
 		optimizer_step_count = int(checkpoint.get("optimizer_step_count", optimizer_step_count))
 		start_step = int(checkpoint.get("step", 0)) + 1
+
+		rng_state = checkpoint.get("rng_state")
+		if isinstance(rng_state, dict):
+			sam_state = rng_state.get("sampler_rng")
+			if isinstance(sam_state, dict):
+				sampler.rng.bit_generator.state = sam_state
+			split_state = rng_state.get("split_rng")
+			if isinstance(split_state, dict):
+				split_rng.bit_generator.state = split_state
+			val_sam_state = rng_state.get("val_sampler_rng")
+			if val_sampler is not None and isinstance(val_sam_state, dict):
+				val_sampler.rng.bit_generator.state = val_sam_state
+			val_split_state = rng_state.get("split_rng_val")
+			if split_rng_val is not None and isinstance(val_split_state, dict):
+				split_rng_val.bit_generator.state = val_split_state
+			ho_sam_state = rng_state.get("val_heldout_sampler_rng")
+			if val_heldout_sampler is not None and isinstance(ho_sam_state, dict):
+				val_heldout_sampler.rng.bit_generator.state = ho_sam_state
+			ho_split_state = rng_state.get("split_rng_heldout")
+			if split_rng_heldout is not None and isinstance(ho_split_state, dict):
+				split_rng_heldout.bit_generator.state = ho_split_state
+
+			python_state = rng_state.get("python_random")
+			if python_state is not None:
+				try:
+					random.setstate(python_state)
+				except Exception:
+					print("[warn] Failed to restore python random state from checkpoint")
+
+			torch_cpu_state = rng_state.get("torch_cpu")
+			if isinstance(torch_cpu_state, torch.Tensor):
+				torch.set_rng_state(torch_cpu_state.cpu())
+
+			torch_cuda_all = rng_state.get("torch_cuda_all")
+			if torch.cuda.is_available() and isinstance(torch_cuda_all, list) and len(torch_cuda_all) > 0:
+				try:
+					torch.cuda.set_rng_state_all([state.cpu() for state in torch_cuda_all])
+				except Exception:
+					print("[warn] Failed to restore CUDA RNG state from checkpoint")
+
+			sam_hard_state = rng_state.get("sampler_hard_rng")
+			if sampler.hard_sampler is not None and isinstance(sam_hard_state, torch.Tensor):
+				sampler.hard_sampler.generator.set_state(sam_hard_state.cpu())
+			val_sam_hard_state = rng_state.get("val_sampler_hard_rng")
+			if val_sampler is not None and val_sampler.hard_sampler is not None and isinstance(val_sam_hard_state, torch.Tensor):
+				val_sampler.hard_sampler.generator.set_state(val_sam_hard_state.cpu())
+			ho_sam_hard_state = rng_state.get("val_heldout_sampler_hard_rng")
+			if (
+				val_heldout_sampler is not None
+				and val_heldout_sampler.hard_sampler is not None
+				and isinstance(ho_sam_hard_state, torch.Tensor)
+			):
+				val_heldout_sampler.hard_sampler.generator.set_state(ho_sam_hard_state.cpu())
 		if start_step > num_steps:
 			print(
 				f"[info] Resume checkpoint already at step {start_step - 1}; "

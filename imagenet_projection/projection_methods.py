@@ -145,6 +145,7 @@ def build_projection_module(
 	hyper_encoder_type: str,
 	hyper_attn_heads: int,
 	hyper_attn_layers: int,
+	hyper_attn_use_pos_embed: bool,
 	use_random_projection_init: bool,
 	device: torch.device,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
@@ -175,6 +176,7 @@ def build_projection_module(
 			encoder_type=str(hyper_encoder_type),
 			attention_num_heads=int(hyper_attn_heads),
 			attention_num_layers=int(hyper_attn_layers),
+			attention_use_positional_embeddings=bool(hyper_attn_use_pos_embed),
 			use_random_projection_init=bool(use_random_projection_init),
 		).to(device)
 	elif method == "vanilla_hypernetwork":
@@ -212,6 +214,7 @@ def build_projection_module(
 		"hyper_encoder_type": str(hyper_encoder_type),
 		"hyper_attn_heads": int(hyper_attn_heads),
 		"hyper_attn_layers": int(hyper_attn_layers),
+		"hyper_attn_use_pos_embed": bool(hyper_attn_use_pos_embed),
 		"hyper_use_random_projection_init": bool(use_random_projection_init),
 	}
 	return module, meta

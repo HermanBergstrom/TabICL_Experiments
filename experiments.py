@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.decomposition import FastICA, PCA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.ensemble import RandomForestClassifier
@@ -267,7 +268,8 @@ def _load_data(
 			num_workers=0,
 			use_images=need_images,
 			#image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features",
-			image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features-rad-dino-mean",
+			#image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features-rad-dino-mean",
+			image_features_root="/project/aip-rahulgk/hermanb/datasets/mimic-cxr-jpg-features-medclip",
 			missing_image_features='drop'
 		)
 	else:
@@ -529,7 +531,11 @@ def _extract_representations_via_subprocess(
 
 
 def _fit_image_reducer(X_train: np.ndarray, name: str, dim: int, seed: int):
-	"""Return a fitted reducer or ``None`` when *name* is ``'none'``."""
+	"""Return an unfitted reducer object or ``None`` when *name* is ``'none'``.
+
+	For PLS, returns an unfitted ``PLSRegression``; ``_apply_reducer`` is
+	responsible for fitting it with ``y_train``.
+	"""
 	if name == "none":
 		return None
 	if dim <= 0:
@@ -547,14 +553,109 @@ def _fit_image_reducer(X_train: np.ndarray, name: str, dim: int, seed: int):
 	if name == "random_projection":
 		return GaussianRandomProjection(n_components=dim, random_state=seed)
 
+	if name == "pls":
+		max_dim = min(X_train.shape[0], X_train.shape[1])
+		effective = min(dim, max_dim)
+		if effective != dim:
+			print(f"[warning] Capping PLS components: {dim} -> {effective}")
+		return PLSRegression(n_components=effective)
+
 	raise ValueError(f"Unknown image reducer: {name}")
 
 
-def _apply_reducer(reducer, X_train, X_val, X_test):
-	"""Fit on *X_train* and transform all three splits.  Pass-through when ``None``."""
+def _apply_reducer(reducer, X_train, X_val, X_test, y_train=None):
+	"""Fit on *X_train* and transform all three splits.  Pass-through when ``None``.
+
+	For label-informed reducers (``PLSRegression``), ``y_train`` must be
+	supplied; ``transform`` returns only the X scores.
+	"""
 	if reducer is None:
 		return X_train, X_val, X_test
+	if isinstance(reducer, PLSRegression):
+		if y_train is None:
+			raise ValueError("PLS reducer requires y_train")
+		reducer.fit(X_train, y_train)
+		return reducer.transform(X_train), reducer.transform(X_val), reducer.transform(X_test)
 	return reducer.fit_transform(X_train), reducer.transform(X_val), reducer.transform(X_test)
+
+
+def _fit_joint_pca_reducer(
+	tab_train: np.ndarray,
+	img_train: np.ndarray,
+	dim: int,
+	seed: int,
+) -> dict:
+	"""Fit a joint PCA reducer on z-normalized tabular + image features.
+
+	Z-normalizes each modality independently (fit on train) so neither
+	modality's raw variance dominates the decomposition, then fits a single
+	PCA on the concatenated matrix.
+
+	Returns a dict with keys ``tab_scaler``, ``img_scaler``, and ``pca``.
+	"""
+	from sklearn.preprocessing import StandardScaler
+
+	tab_scaler = StandardScaler().fit(tab_train)
+	img_scaler = StandardScaler().fit(img_train)
+
+	X_joint_train = np.concatenate(
+		[tab_scaler.transform(tab_train), img_scaler.transform(img_train)], axis=1
+	)
+	max_dim = min(X_joint_train.shape[0], X_joint_train.shape[1])
+	effective = min(dim, max_dim)
+	if effective != dim:
+		print(f"[warning] Capping joint_pca components: {dim} -> {effective}")
+	pca = PCA(n_components=effective, random_state=seed).fit(X_joint_train)
+
+	return {"tab_scaler": tab_scaler, "img_scaler": img_scaler, "pca": pca}
+
+
+def _apply_joint_pca_reducer(reducer: dict, tab: np.ndarray, img: np.ndarray) -> np.ndarray:
+	"""Apply a fitted joint PCA reducer to a (tab, img) pair."""
+	X_joint = np.concatenate(
+		[reducer["tab_scaler"].transform(tab), reducer["img_scaler"].transform(img)], axis=1
+	)
+	return reducer["pca"].transform(X_joint)
+
+
+def _fit_joint_pls_reducer(
+	tab_train: np.ndarray,
+	img_train: np.ndarray,
+	y_train: np.ndarray,
+	dim: int,
+) -> dict:
+	"""Fit a joint PLS reducer on z-normalized tabular + image features.
+
+	Z-normalizes each modality independently (fit on train), concatenates,
+	then fits ``PLSRegression`` against ``y_train``.  Being label-informed,
+	the resulting components capture joint variance that is predictive of the
+	target.
+
+	Returns a dict with keys ``tab_scaler``, ``img_scaler``, and ``pls``.
+	"""
+	from sklearn.preprocessing import StandardScaler
+
+	tab_scaler = StandardScaler().fit(tab_train)
+	img_scaler = StandardScaler().fit(img_train)
+
+	X_joint_train = np.concatenate(
+		[tab_scaler.transform(tab_train), img_scaler.transform(img_train)], axis=1
+	)
+	max_dim = min(X_joint_train.shape[0], X_joint_train.shape[1])
+	effective = min(dim, max_dim)
+	if effective != dim:
+		print(f"[warning] Capping joint_pls components: {dim} -> {effective}")
+	pls = PLSRegression(n_components=effective).fit(X_joint_train, y_train)
+
+	return {"tab_scaler": tab_scaler, "img_scaler": img_scaler, "pls": pls}
+
+
+def _apply_joint_pls_reducer(reducer: dict, tab: np.ndarray, img: np.ndarray) -> np.ndarray:
+	"""Apply a fitted joint PLS reducer to a (tab, img) pair; returns X scores."""
+	X_joint = np.concatenate(
+		[reducer["tab_scaler"].transform(tab), reducer["img_scaler"].transform(img)], axis=1
+	)
+	return reducer["pls"].transform(X_joint)
 
 
 # ===================================================================
@@ -571,6 +672,7 @@ def _build_features(
 	reducer_dim: int,
 	seed: int,
 	X_rep: tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None] = (None, None, None),
+	y_train: np.ndarray | None = None,
 ):
 	"""Assemble final feature matrices for ``(train, val, test)``.
 
@@ -598,7 +700,7 @@ def _build_features(
 				f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
 			)
 		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
-		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test, y_train=y_train)
 		return img_train, img_val, img_test, reducer
 
 	if mode == "text":
@@ -607,7 +709,7 @@ def _build_features(
 				f"feature_mode='{mode}' requires text embeddings, but the dataset has none."
 			)
 		reducer = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
-		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test)
+		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test, y_train=y_train)
 		return text_train, text_val, text_test, reducer
 
 	if mode == "concat":
@@ -620,10 +722,26 @@ def _build_features(
 				f"feature_mode='{mode}' requires text embeddings, but the dataset has none. "
 				"Use feature_mode='concat_image' to concatenate tabular+image only."
 			)
+		if reducer_name in ("joint_pca", "joint_pls"):
+			img_text_train = np.concatenate([img_train, text_train], axis=1)
+			img_text_val = np.concatenate([img_val, text_val], axis=1)
+			img_text_test = np.concatenate([img_test, text_test], axis=1)
+			if reducer_name == "joint_pls":
+				reducer = _fit_joint_pls_reducer(tab_train, img_text_train, y_train, reducer_dim)
+				apply_fn = _apply_joint_pls_reducer
+			else:
+				reducer = _fit_joint_pca_reducer(tab_train, img_text_train, reducer_dim, seed)
+				apply_fn = _apply_joint_pca_reducer
+			return (
+				apply_fn(reducer, tab_train, img_text_train),
+				apply_fn(reducer, tab_val, img_text_val),
+				apply_fn(reducer, tab_test, img_text_test),
+				reducer,
+			)
 		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
-		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test, y_train=y_train)
 		reducer_text = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
-		text_train, text_val, text_test = _apply_reducer(reducer_text, text_train, text_val, text_test)
+		text_train, text_val, text_test = _apply_reducer(reducer_text, text_train, text_val, text_test, y_train=y_train)
 		return (
 			np.concatenate([tab_train, img_train, text_train], axis=1),
 			np.concatenate([tab_val, img_val, text_val], axis=1),
@@ -636,8 +754,21 @@ def _build_features(
 			raise ValueError(
 				f"feature_mode='{mode}' requires image embeddings, but the dataset has none."
 			)
+		if reducer_name in ("joint_pca", "joint_pls"):
+			if reducer_name == "joint_pls":
+				reducer = _fit_joint_pls_reducer(tab_train, img_train, y_train, reducer_dim)
+				apply_fn = _apply_joint_pls_reducer
+			else:
+				reducer = _fit_joint_pca_reducer(tab_train, img_train, reducer_dim, seed)
+				apply_fn = _apply_joint_pca_reducer
+			return (
+				apply_fn(reducer, tab_train, img_train),
+				apply_fn(reducer, tab_val, img_val),
+				apply_fn(reducer, tab_test, img_test),
+				reducer,
+			)
 		reducer = _fit_image_reducer(img_train, reducer_name, reducer_dim, seed)
-		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test)
+		img_train, img_val, img_test = _apply_reducer(reducer, img_train, img_val, img_test, y_train=y_train)
 		return (
 			np.concatenate([tab_train, img_train], axis=1),
 			np.concatenate([tab_val, img_val], axis=1),
@@ -651,7 +782,7 @@ def _build_features(
 				f"feature_mode='{mode}' requires text embeddings, but the dataset has none."
 			)
 		reducer = _fit_image_reducer(text_train, reducer_name, reducer_dim, seed)
-		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test)
+		text_train, text_val, text_test = _apply_reducer(reducer, text_train, text_val, text_test, y_train=y_train)
 		return (
 			np.concatenate([tab_train, text_train], axis=1),
 			np.concatenate([tab_val, text_val], axis=1),
@@ -730,15 +861,19 @@ def _resolve_feature_experiments(
 
 	d = suite_reducer_dim
 	configs = [
-		("tabular_only",     "tabular", "none"),
-		("image_only",       "image",   "none"),
-		(f"image_pca{d}",    "image",   "pca"),
-		(f"image_ica{d}",    "image",   "ica"),
-		(f"image_rp{d}",     "image",   "random_projection"),
-		("concat",           "concat",  "none"),
-		(f"concat_pca{d}",   "concat",  "pca"),
-		(f"concat_ica{d}",   "concat",  "ica"),
-		(f"concat_rp{d}",    "concat",  "random_projection"),
+		("tabular_only",          "tabular",      "none"),
+		("image_only",            "image",        "none"),
+		(f"image_pca{d}",         "image",        "pca"),
+		(f"image_ica{d}",         "image",        "ica"),
+		(f"image_rp{d}",          "image",        "random_projection"),
+		(f"image_pls{d}",         "image",        "pls"),
+		("concat",                "concat_image", "none"),
+		(f"concat_pca{d}",        "concat_image", "pca"),
+		(f"concat_ica{d}",        "concat_image", "ica"),
+		(f"concat_rp{d}",         "concat_image", "random_projection"),
+		(f"concat_pls{d}",        "concat_image", "pls"),
+		(f"concat_joint_pca{d}",  "concat_image", "joint_pca"),
+		(f"concat_joint_pls{d}",  "concat_image", "joint_pls"),
 	]
 	return [
 		{"label": label, "feature_mode": mode, "image_reducer": reducer, "image_reducer_dim": d}
@@ -1238,6 +1373,7 @@ def run_experiment(
 					reducer_dim=cfg_dim,
 					seed=seed,
 					X_rep=(X_rep_train, X_rep_val, X_rep_test) if use_reps else (None, None, None),
+					y_train=y_train,
 				)
 				X_train_f, X_val_f, X_test_f, fitted_augmenter = _apply_dimensionality_augmentation(
 					X_train_f,
@@ -1267,7 +1403,11 @@ def run_experiment(
 				)
 				print(f"[info] {model_name} feature_source: {model_feature_source} | dim={X_train_f.shape[1]}")
 				if fitted_reducer is not None:
-					if isinstance(fitted_reducer, dict):
+					if isinstance(fitted_reducer, dict) and "pca" in fitted_reducer:
+						print(f"[info] Reducer: joint_pca (dim={fitted_reducer['pca'].n_components_})")
+					elif isinstance(fitted_reducer, dict) and "pls" in fitted_reducer:
+						print(f"[info] Reducer: joint_pls (dim={fitted_reducer['pls'].n_components})")
+					elif isinstance(fitted_reducer, dict):
 						img_dim = getattr(fitted_reducer.get("image_reducer"), "n_components", "?")
 						text_dim = getattr(fitted_reducer.get("text_reducer"), "n_components", "?")
 						print(f"[info] Reducers: image={cfg_reducer}({img_dim}) text={cfg_reducer}({text_dim})")
@@ -1374,7 +1514,7 @@ def parse_args() -> argparse.Namespace:
 	p.add_argument("--feature-source", "--image-source", dest="feature_source", type=str,
 		choices=["dinov3", "vertexai", "dinov3_text"], default="dinov3",
 		help="Embedding source for supported dataset loaders. PetFinder supports dinov3, vertexai, and dinov3_text.")
-	p.add_argument("--image-reducer", type=str, choices=["none", "pca", "ica", "random_projection"], default="none")
+	p.add_argument("--image-reducer", type=str, choices=["none", "pca", "ica", "random_projection", "pls", "joint_pca", "joint_pls"], default="none")
 	p.add_argument("--image-reducer-dim", type=int, default=128)
 	p.add_argument("--feature-suite", action="store_true",
 		help="Run the full 9-config feature comparison suite")

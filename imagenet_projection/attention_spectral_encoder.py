@@ -20,6 +20,7 @@ class AttentionSpectralEncoder(nn.Module):
         embed_dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
+        use_positional_embeddings: bool = False,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -38,9 +39,15 @@ class AttentionSpectralEncoder(nn.Module):
         self.input_dim = int(input_dim)
         self.top_k = int(top_k)
         self.context_hidden_dim = int(embed_dim)
+        self.use_positional_embeddings = bool(use_positional_embeddings)
 
         # 1. Project singular-value-weighted vectors to embedding dimension.
         self.token_projection = nn.Linear(self.input_dim, self.context_hidden_dim)
+        self.pos_embed: nn.Parameter | None
+        if self.use_positional_embeddings:
+            self.pos_embed = nn.Parameter(torch.randn(1, self.top_k, self.context_hidden_dim) * 0.02)
+        else:
+            self.pos_embed = None
 
         # 2. Lightweight Transformer
         encoder_layer = nn.TransformerEncoderLayer(
@@ -112,6 +119,8 @@ class AttentionSpectralEncoder(nn.Module):
 
         # Pass through architecture
         x = self.token_projection(tokens)
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
         x = self.transformer(x)
 
         return x
