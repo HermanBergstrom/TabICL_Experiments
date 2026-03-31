@@ -10,7 +10,7 @@ import time
 import torch
 import torch.nn as nn
 
-from .attention_spectral_encoder import AttentionSpectralEncoder
+from .attention_spectral_encoder import AttentionSpectralEncoder, AttentionSpectralLDAEncoder
 from .attention_spectral_decoder import ParallelQueryDecoder
 
 
@@ -180,6 +180,9 @@ class SpectralHypernetworkAdapter(nn.Module):
         tiny_weight_std: float = 1e-4,
         covariance_jitter: float = 1e-6,
         use_random_projection_init: bool = True,
+        svd_scale_by_singular_values: bool = True,
+        lda_scale_by_eigenvalues: bool = True,
+        lda_regularization: float = 1e-4,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -190,15 +193,15 @@ class SpectralHypernetworkAdapter(nn.Module):
             raise ValueError("top_k_components must be > 0")
         if context_hidden_dim <= 0:
             raise ValueError("context_hidden_dim must be > 0")
-        if encoder_type not in {"mlp", "attention"}:
-            raise ValueError("encoder_type must be one of ['mlp', 'attention']")
+        if encoder_type not in {"mlp", "attention", "attention_lda"}:
+            raise ValueError("encoder_type must be one of ['mlp', 'attention', 'attention_lda']")
         if attention_num_heads <= 0:
             raise ValueError("attention_num_heads must be > 0")
         if attention_num_layers <= 0:
             raise ValueError("attention_num_layers must be > 0")
         if low_rank_dim is not None and low_rank_dim <= 0:
             raise ValueError("low_rank_dim must be > 0 when provided")
-        if encoder_type == "attention" and low_rank_dim is not None:
+        if encoder_type in {"attention", "attention_lda"} and low_rank_dim is not None:
             raise ValueError("low_rank_dim is only supported when encoder_type='mlp'")
         if tiny_weight_std <= 0:
             raise ValueError("tiny_weight_std must be > 0")
@@ -223,7 +226,7 @@ class SpectralHypernetworkAdapter(nn.Module):
                 context_hidden_dim=context_hidden_dim,
                 covariance_jitter=covariance_jitter,
             )
-        else:
+        elif self.encoder_type == "attention":
             self.encoder = AttentionSpectralEncoder(
                 input_dim=self.input_dim,
                 top_k=self.top_k_components,
@@ -231,6 +234,27 @@ class SpectralHypernetworkAdapter(nn.Module):
                 num_heads=int(attention_num_heads),
                 num_layers=int(attention_num_layers),
                 use_positional_embeddings=self.attention_use_positional_embeddings,
+                scale_svd_by_singular_values=bool(svd_scale_by_singular_values),
+            )
+            self.query_decoder = ParallelQueryDecoder(
+                embed_dim=int(context_hidden_dim),
+                target_rows=self.input_dim,
+                output_cols=self.output_dim,
+                num_heads=int(attention_num_heads),
+                num_layers=int(attention_num_layers),
+            )
+            self.output_bias = nn.Parameter(torch.zeros(self.output_dim))
+        else:  # "attention_lda"
+            self.encoder = AttentionSpectralLDAEncoder(
+                input_dim=self.input_dim,
+                top_k=self.top_k_components,
+                embed_dim=int(context_hidden_dim),
+                num_heads=int(attention_num_heads),
+                num_layers=int(attention_num_layers),
+                use_positional_embeddings=self.attention_use_positional_embeddings,
+                scale_svd_by_singular_values=bool(svd_scale_by_singular_values),
+                scale_lda_by_eigenvalues=bool(lda_scale_by_eigenvalues),
+                lda_regularization=float(lda_regularization),
             )
             self.query_decoder = ParallelQueryDecoder(
                 embed_dim=int(context_hidden_dim),
@@ -279,6 +303,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         *,
         features: torch.Tensor,
         support_indices: torch.Tensor,
+        support_labels: torch.Tensor | None = None,
         return_projection_matrix: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project all episode rows using support-conditioned generated weights.
@@ -286,6 +311,7 @@ class SpectralHypernetworkAdapter(nn.Module):
         Args:
             features: Episode tensor of shape [N, D].
             support_indices: Row indices used to build support-conditioned context.
+            support_labels: Episode label tensor [N] required for encoder_type='attention_lda'.
         """
         if features.ndim != 2:
             raise ValueError(f"Expected features shape [N, D], got {tuple(features.shape)}")
@@ -303,25 +329,29 @@ class SpectralHypernetworkAdapter(nn.Module):
         support_mean = x_support.mean(dim=0, keepdim=True)
         x_target = features - support_mean
 
-        if self.encoder_type == "attention":
-            #print("Using attention-based spectral encoder and decoder")
+        if self.encoder_type in {"attention", "attention_lda"}:
             if self.query_decoder is None or self.output_bias is None:
                 raise RuntimeError("attention encoder_type requires query_decoder and output_bias")
             t_enc0 = _synchronized_perf_counter(features.device)
-            context = self.encoder(x_support)
+            if self.encoder_type == "attention_lda":
+                if support_labels is None:
+                    raise ValueError("support_labels is required for encoder_type='attention_lda'")
+                y_support = support_labels.index_select(0, support_indices)
+                context = self.encoder(x_support, y_support)
+            else:
+                context = self.encoder(x_support)
             t_enc1 = _synchronized_perf_counter(features.device)
 
             t_dec0 = _synchronized_perf_counter(features.device)
             W = self.query_decoder(context)
             t_dec1 = _synchronized_perf_counter(features.device)
-            #print("Calculated W")
-            #print("X_support shape:", x_support.shape)
             b = self.output_bias
             encoder_ms = float((t_enc1 - t_enc0) * 1000.0)
             decoder_ms = float((t_dec1 - t_dec0) * 1000.0)
-            eigendecomp_ms = float(getattr(self.encoder, "last_profile", {}).get("eigendecomp_ms", 0.0))
+            enc_profile = getattr(self.encoder, "last_profile", {})
             self.last_profile = {
-                "eigendecomp_ms": eigendecomp_ms,
+                "eigendecomp_ms": float(enc_profile.get("eigendecomp_ms", 0.0)),
+                "lda_ms": float(enc_profile.get("lda_ms", 0.0)),
                 "encoder_ms": encoder_ms,
                 "decoder_ms": decoder_ms,
                 "hypernetwork_forward_ms": float(encoder_ms + decoder_ms),

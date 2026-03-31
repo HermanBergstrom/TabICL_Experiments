@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import SamplingConfig
@@ -52,202 +51,143 @@ def _sample_from_distribution(
 		)
 
 
-class HardNegativeClassSampler:
-	"""Hard negative class sampler using cosine similarity of class centroids.
-	
-	Selects challenging classification tasks by sampling classes that are
-	difficult to distinguish (similar in feature space) using a 50/50 strategy:
-	- 50% of the time: uniform random class selection
-	- 50% of the time: hard negatives guided by class centroid similarity
+class ClusterBasedClassSampler:
+	"""Cluster-based class sampler using pre-computed K-means cluster assignments.
+
+	Classes within the same K-means cluster are semantically similar in feature
+	space, so sampling from a cluster produces harder, more informative
+	classification tasks than uniform sampling.
+
+	The cluster file is prepared offline via:
+	    python -m imagenet_projection.prepare_clusters --help
+
+	Multiple independent clustering runs (different K-means seeds) are stored in
+	the cluster file.  At each call to :meth:`sample_classes` a run is chosen at
+	random, ensuring diversity of the cluster structure seen during training.
 	"""
 
 	def __init__(
 		self,
-		class_centroids: torch.Tensor,
-		device: torch.device | str = "cpu",
-		temperature: float = 0.1,
+		cluster_file: Path,
+		valid_classes: set[int],
 		seed: int = 0,
 	) -> None:
-		"""Initialize with class centroids and precompute similarity matrix.
-		
+		"""Load and pre-filter cluster data.
+
 		Args:
-			class_centroids: Tensor of shape [num_classes, feature_dim].
-			device: Device to place the similarity matrix on (GPU recommended).
-			temperature: Temperature parameter for softmax. Lower values enforce
-				stricter nearest neighbor selection. Default 0.1.
+			cluster_file  : Path to the .pt file produced by prepare_clusters.py.
+			valid_classes : Set of class IDs that are available for sampling
+			                (i.e. present in the shard data and not held-out).
+			                Clusters are filtered to this set at init time.
+			seed          : Seed for the internal numpy RNG.
 		"""
-		self.device = torch.device(device) if isinstance(device, str) else device
-		self.temperature = temperature
-		self.num_classes = class_centroids.shape[0]
-		self.generator = torch.Generator(device=self.device.type)
-		self.generator.manual_seed(int(seed))
+		if not cluster_file.exists():
+			raise FileNotFoundError(f"Cluster file not found: {cluster_file}")
 
-		# L2-normalize centroids for cosine similarity computation
-		centroids_norm = F.normalize(class_centroids.to(self.device), p=2, dim=1)
-		
-		# Precompute the num_classes x num_classes cosine similarity matrix
-		# Value range: [-1, 1], where 1 indicates identical classes
-		self.sim_matrix = torch.matmul(centroids_norm, centroids_norm.T)
+		data: dict[str, Any] = torch.load(cluster_file, map_location="cpu", weights_only=False)
+		raw_runs: list[dict[int, list[int]]] = data["cluster_runs"]
 
-	@torch.no_grad()
-	def sample_classes(
-		self,
-		k_classes: int,
-		hard_prob: float = 0.5,
-	) -> torch.Tensor:
-		"""Sample k_classes using hard negative sampling or uniform selection.
-		
-		With probability hard_prob, samples classes based on cosine similarity
-		to already-selected classes (hard negatives). Otherwise, samples uniformly.
-		
-		Args:
-			k_classes: Number of classes to sample.
-			hard_prob: Probability of using hard sampling (vs. uniform).
-				Default 0.5 (50/50 split).
-		
-		Returns:
-			Tensor of shape [k_classes] containing selected class indices.
-		
-		Raises:
-			ValueError: If k_classes > num_classes or k_classes <= 0.
-		"""
-		if k_classes <= 0:
-			raise ValueError(f"k_classes must be > 0, got {k_classes}")
-		if k_classes > self.num_classes:
-			raise ValueError(
-				f"k_classes={k_classes} exceeds num_classes={self.num_classes}"
-			)
+		# For each run, keep only classes that are in valid_classes and drop
+		# clusters that become too small to be useful (need >= 2 classes).
+		self.filtered_runs: list[list[list[int]]] = []
+		for run in raw_runs:
+			filtered_clusters: list[list[int]] = []
+			for classes in run.values():
+				kept = [c for c in classes if c in valid_classes]
+				if len(kept) >= 2:
+					filtered_clusters.append(kept)
+			self.filtered_runs.append(filtered_clusters)
 
-		# 50/50 coin flip: uniform or hard sampling
-		if torch.rand(1, device=self.device, generator=self.generator).item() > hard_prob:
-			return torch.randperm(self.num_classes, device=self.device, generator=self.generator)[:k_classes]
+		self.rng = np.random.default_rng(seed)
 
-		# Hard negative sampling: iteratively select difficult classes
-		selected = torch.zeros(k_classes, dtype=torch.long, device=self.device)
-
-		# Step 1: Pick the first class uniformly at random
-		selected[0] = torch.randint(
-			0,
-			self.num_classes,
-			(1,),
-			device=self.device,
-			generator=self.generator,
+		n_runs = len(self.filtered_runs)
+		avg_clusters = float(np.mean([len(r) for r in self.filtered_runs])) if self.filtered_runs else 0.0
+		print(
+			f"[info] ClusterBasedClassSampler: {n_runs} runs loaded, "
+			f"avg {avg_clusters:.1f} valid clusters/run",
+			flush=True,
 		)
 
-		# Track which classes have been selected
-		available_mask = torch.ones(self.num_classes, dtype=torch.bool, device=self.device)
-		available_mask[selected[0]] = False
+	def sample_classes(self, n_classes: int) -> list[int] | None:
+		"""Sample *n_classes* class IDs from a randomly chosen cluster.
 
-		# Track the maximum similarity to ANY already-selected class
-		# Initialized with the similarity row of the first selected class
-		current_max_sim = self.sim_matrix[selected[0]].clone()
+		Args:
+			n_classes: Number of classes to sample.
 
-		# Step 2-K: Iteratively sample hard negatives
-		for i in range(1, k_classes):
-			# Create logits from similarity scores
-			logits = current_max_sim.clone()
-			
-			# Mask out already-selected classes by setting logits to -inf
-			# This ensures they get probability 0 after softmax
-			logits[~available_mask] = -float("inf")
+		Returns:
+			List of *n_classes* class IDs, or ``None`` if no cluster in the
+			chosen run has enough classes (caller should fall back to uniform).
+		"""
+		run_idx = int(self.rng.integers(0, len(self.filtered_runs)))
+		run = self.filtered_runs[run_idx]
 
-			# Apply temperature and convert to probabilities
-			probs = F.softmax(logits / self.temperature, dim=0)
+		valid = [c for c in run if len(c) >= n_classes]
+		if not valid:
+			return None
 
-			# Sample the next class according to similarity-based probabilities
-			next_class = torch.multinomial(probs, num_samples=1, generator=self.generator)[0]
-			selected[i] = next_class
-
-			# Update: mark this class as selected
-			available_mask[next_class] = False
-			
-			# Magic step: Update running maximum similarity
-			# For each candidate class, track its maximum similarity to any
-			# already-selected class. Classes similar to already-selected ones
-			# become more likely to be selected (higher difficulty).
-			current_max_sim = torch.maximum(
-				current_max_sim,
-				self.sim_matrix[next_class]
-			)
-
-		return selected
-
-
-def _compute_class_centroids(
-	output_dir: Path,
-	split: str,
-	shards: list[dict[str, Any]],
-	num_classes: int,
-	device: torch.device | str = "cpu",
-) -> torch.Tensor:
-	"""Compute class centroids from shard data.
-	
-	Computes the mean feature vector for each class across all shards.
-	
-	Args:
-		output_dir: Path to directory containing shard files.
-		split: Data split name (e.g., "train", "val").
-		shards: List of shard metadata dictionaries.
-		num_classes: Total number of classes (e.g., 1000 for ImageNet).
-		device: Device to place centroids on (CPU by default, GPU for faster sampling).
-	
-	Returns:
-		Tensor of shape [num_classes, feature_dim] containing class centroids.
-	"""
-	if device is not None and not isinstance(device, torch.device):
-		device = torch.device(device)
-
-	# Accumulate features and counts per class
-	class_sum: dict[int, torch.Tensor] = {}
-	class_count: dict[int, int] = {}
-
-	with torch.no_grad():
-		for shard_meta in tqdm(shards, desc=f"compute centroids {split}"):
-			shard_id = int(shard_meta["shard_id"])
-			shard_path = output_dir / str(shard_meta["file"])
-			
-			if not shard_path.exists():
-				raise FileNotFoundError(f"Shard listed in manifest is missing: {shard_path}")
-
-			shard = torch.load(shard_path, map_location="cpu", weights_only=True)
-			features = shard["features"].float()  # [num_samples, feature_dim]
-			targets = shard["targets"].long()  # [num_samples]
-
-			if not isinstance(features, torch.Tensor) or not isinstance(targets, torch.Tensor):
-				raise TypeError(f"Shard must contain tensor features and targets: {shard_path}")
-
-			# Accumulate by class
-			for class_id in range(num_classes):
-				mask = targets == class_id
-				if mask.any():
-					class_features = features[mask]
-					class_sum[class_id] = (
-						class_sum.get(class_id, torch.zeros_like(class_features[0]).cpu())
-						+ class_features.sum(dim=0).cpu()
-					)
-					class_count[class_id] = class_count.get(class_id, 0) + int(mask.sum().item())
-
-	# Compute centroids by averaging
-	centroids_list: list[torch.Tensor] = []
-	for class_id in range(num_classes):
-		if class_id in class_count and class_count[class_id] > 0:
-			centroid = class_sum[class_id] / class_count[class_id]
-		else:
-			# Handle missing classes with zero vector
-			# (Infer feature dim from first available centroid)
-			if centroids_list:
-				centroid = torch.zeros_like(centroids_list[0])
-			else:
-				# Fallback: assume 768-dim features (typical for ViT-B)
-				centroid = torch.zeros(768, dtype=torch.float32)
-		centroids_list.append(centroid)
-
-	centroids = torch.stack(centroids_list, dim=0).to(device)
-	return centroids
+		cluster = valid[int(self.rng.integers(0, len(valid)))]
+		chosen_idx = self.rng.choice(len(cluster), size=n_classes, replace=False)
+		return [cluster[int(i)] for i in chosen_idx]
 
 
 class ShardedEmbeddingSampler:
 	"""Class-first sampler over persisted shard embeddings."""
+
+	@classmethod
+	def preload_from_disk(
+		cls,
+		output_dir: Path,
+		split: str,
+	) -> tuple[torch.Tensor, dict[int, list[int]]]:
+		"""Load all shard features into RAM and build a class→row-index mapping.
+
+		Returns a ``(features_all, class_to_rows)`` tuple that can be passed as
+		``preloaded_data`` to multiple :class:`ShardedEmbeddingSampler` instances
+		that share the same split, avoiding redundant I/O and memory copies.
+		"""
+		manifest_file = _manifest_path(output_dir, split)
+		if not manifest_file.exists():
+			raise FileNotFoundError(f"Manifest not found: {manifest_file}")
+		with manifest_file.open("r", encoding="utf-8") as f:
+			manifest = json.load(f)
+		shards = list(manifest.get("shards", []))
+		if not shards:
+			raise ValueError(f"No shards in manifest: {manifest_file}")
+		shard_by_id = {int(s["shard_id"]): s for s in shards}
+
+		# Determine total sample count and feature dim from manifest + first shard,
+		# then pre-allocate the output tensor so we never hold two full copies in RAM.
+		total_samples: int | None = manifest.get("total_dataset_size") or manifest.get("processed_samples")
+		first_shard_path = output_dir / str(shard_by_id[shards[0]["shard_id"]]["file"])
+		first_shard = torch.load(first_shard_path, map_location="cpu", weights_only=True)
+		feature_dim = int(first_shard["features"].shape[1])
+		feature_dtype = first_shard["features"].dtype
+		del first_shard
+
+		if total_samples is None:
+			total_samples = sum(int(s["num_samples"]) for s in shards)
+
+		features_all = torch.empty((total_samples, feature_dim), dtype=feature_dtype)
+
+		class_to_rows: dict[int, list[int]] = {}
+		row_offset = 0
+		for shard_meta in tqdm(shards, desc=f"preload {split} shards"):
+			shard_path = output_dir / str(shard_by_id[int(shard_meta["shard_id"])]["file"])
+			if not shard_path.exists():
+				raise FileNotFoundError(f"Shard listed in manifest is missing: {shard_path}")
+			shard = torch.load(shard_path, map_location="cpu", weights_only=True)
+			features = shard["features"]
+			targets = shard["targets"]
+			if not isinstance(features, torch.Tensor) or not isinstance(targets, torch.Tensor):
+				raise TypeError(f"Shard must contain tensor features and targets: {shard_path}")
+			n = int(features.shape[0])
+			features_all[row_offset : row_offset + n].copy_(features)
+			targets_np = np.asarray(targets.cpu().numpy()).reshape(-1)
+			for local_idx, class_id in enumerate(targets_np.tolist()):
+				class_to_rows.setdefault(int(class_id), []).append(row_offset + int(local_idx))
+			row_offset += n
+
+		return features_all, class_to_rows
 
 	def __init__(
 		self,
@@ -258,12 +198,17 @@ class ShardedEmbeddingSampler:
 		max_cached_shards: int = 8,
 		sampler_backend: str = "shard",
 		excluded_classes: set[int] | None = None,
-		enable_hard_sampling: bool = False,
-		num_classes: int = 1000,
-		hard_sampling_temperature: float = 0.1,
-		hard_sampling_prob: float = 0.5,
-		hard_sampling_device: str = "cpu",
+		cluster_file: Path | None = None,
+		preloaded_data: tuple[torch.Tensor, dict[int, list[int]]] | None = None,
 	) -> None:
+		"""
+		Args:
+			preloaded_data: Optional ``(features_all, class_to_rows)`` tuple returned
+			    by :meth:`preload_from_disk`.  When provided with
+			    ``sampler_backend="preload"``, the shard files are not read again —
+			    the tensor is shared in-memory across all samplers that receive it.
+			    Ignored when ``sampler_backend="shard"``.
+		"""
 		self.output_dir = output_dir
 		self.split = split
 		self.rng = np.random.default_rng(seed)
@@ -285,32 +230,29 @@ class ShardedEmbeddingSampler:
 		self.shard_by_id = {int(s["shard_id"]): s for s in self.shards}
 
 		if self.sampler_backend == "preload":
-			self.features_all, self.class_to_locations = self._preload_all_data()
+			if preloaded_data is not None:
+				self.features_all, self.class_to_locations = preloaded_data
+			else:
+				self.features_all, self.class_to_locations = self._preload_all_data()
 		else:
 			self.features_all = None
 			self.class_to_locations = self._build_class_index()
 		all_classes = sorted(self.class_to_locations.keys())
-		self.available_classes = sorted([c for c in all_classes if c not in self.excluded_classes])
+		self.available_classes = sorted([
+			c for c in all_classes
+			if c not in self.excluded_classes and len(self.class_to_locations[c]) >= 2
+		])
 		if len(self.available_classes) < 2:
 			raise ValueError("Need at least 2 classes available for class-first sampling after excluding classes")
 
 		self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
 
-		# Optional hard negative sampling
-		self.hard_sampler: HardNegativeClassSampler | None = None
-		self.hard_sampling_prob = hard_sampling_prob
-		if enable_hard_sampling:
-			centroids = _compute_class_centroids(
-				output_dir=output_dir,
-				split=split,
-				shards=self.shards,
-				num_classes=num_classes,
-				device=hard_sampling_device,
-			)
-			self.hard_sampler = HardNegativeClassSampler(
-				class_centroids=centroids,
-				device=hard_sampling_device,
-				temperature=hard_sampling_temperature,
+		# Optional cluster-based class sampling
+		self.cluster_sampler: ClusterBasedClassSampler | None = None
+		if cluster_file is not None:
+			self.cluster_sampler = ClusterBasedClassSampler(
+				cluster_file=cluster_file,
+				valid_classes=set(self.available_classes),
 				seed=seed,
 			)
 
@@ -445,27 +387,18 @@ class ShardedEmbeddingSampler:
 				f"Requested {n_classes} classes but only {len(self.available_classes)} are available"
 			)
 
-		# Select classes: use hard negative sampling if available
-		if self.hard_sampler is not None:
-			# Hard sampling from all 1000 classes, then filter to available
-			all_classes_set = set(self.available_classes)
-			max_attempts = 10  # Prevent infinite loops
-			for attempt in range(max_attempts):
-				sampled = self.hard_sampler.sample_classes(
-					k_classes=n_classes,
-					hard_prob=self.hard_sampling_prob,
-				)
-				# Convert to available classes only
-				class_ids_list = [int(c) for c in sampled.cpu().tolist() if int(c) in all_classes_set]
-				if len(class_ids_list) >= n_classes:
-					class_ids = np.asarray(class_ids_list[:n_classes], dtype=np.int64)
-					break
+		# Select classes: cluster-based sampling when available, otherwise uniform
+		used_cluster_sampling = False
+		if self.cluster_sampler is not None:
+			sampled = self.cluster_sampler.sample_classes(n_classes)
+			if sampled is not None:
+				class_ids = np.asarray(sampled, dtype=np.int64)
+				used_cluster_sampling = True
 			else:
-				# Fallback to uniform sampling if hard sampling doesn't yield enough valid classes
+				# No cluster had enough classes; fall back to uniform
 				class_ids = self.rng.choice(self.available_classes, size=n_classes, replace=False)
 				class_ids = np.asarray(class_ids, dtype=np.int64)
 		else:
-			# Uniform sampling from available classes
 			class_ids = self.rng.choice(self.available_classes, size=n_classes, replace=False)
 			class_ids = np.asarray(class_ids, dtype=np.int64)
 
@@ -555,7 +488,7 @@ class ShardedEmbeddingSampler:
 			"class_capacities": capacities.tolist(),
 			"shrunk_for_capacity": bool((not allow_replacement) and (int(X.shape[0]) < requested_size)),
 			"sampler_backend": self.sampler_backend,
-			"used_hard_sampling": self.hard_sampler is not None,
+			"used_cluster_sampling": used_cluster_sampling,
 		}
 		return np.asarray(X.numpy()), y_np, meta
 
@@ -607,11 +540,7 @@ def sample_datasets_loop(config: SamplingConfig):
 		seed=config.seed,
 		max_cached_shards=config.max_cached_shards,
 		sampler_backend=config.sampler_backend,
-		enable_hard_sampling=config.enable_hard_sampling,
-		num_classes=config.num_classes,
-		hard_sampling_temperature=config.hard_sampling_temperature,
-		hard_sampling_prob=config.hard_sampling_prob,
-		hard_sampling_device=config.hard_sampling_device,
+		cluster_file=config.cluster_file,
 	)
 
 	max_classes_allowed = min(config.max_classes, len(sampler.available_classes))

@@ -76,6 +76,8 @@ def _apply_stored_train_args(
         "repo_dir",
         "weights",
         "sample_output_dir",
+        "cluster_file",
+        "butterfly_features_dir",
         "tabicl_model_path",
         "checkpoint_dir",
         "train_output",
@@ -181,34 +183,35 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
             "smaller datasets (aligns with scaling laws); 'uniform' samples linearly."
         ),
     )
+    parser.add_argument("--sample-output-dir", type=Path, default=None, help="Optional directory to persist sampled datasets as .npz files.")
     parser.add_argument(
-        "--enable-hard-sampling",
-        action="store_true",
+        "--cluster-file",
+        type=Path,
+        default=None,
         help=(
-            "Enable hard negative class sampling using cosine similarity of class centroids. "
-            "This selects more challenging classification tasks by favoring similar classes."
+            "Path to a pre-computed cluster file produced by "
+            "imagenet_projection/prepare_clusters.py. "
+            "When provided, enables cluster-based class sampling which draws classes "
+            "from within a K-means cluster, producing harder classification tasks. "
+            "When omitted, uniform class sampling is used."
         ),
     )
     parser.add_argument(
-        "--hard-sampling-temperature",
-        type=float,
-        default=0.1,
-        help="Temperature for hard sampling softmax. Lower = stricter nearest neighbor selection.",
+        "--butterfly-features-dir",
+        type=Path,
+        default=Path("/project/aip-rahulgk/hermanb/datasets/butterfly-image-classification"),
+        help=(
+            "Path to directory containing butterfly_train_dinov3_features.pt and "
+            "butterfly_test_dinov3_features.pt. Butterfly accuracy is evaluated at each "
+            "val step and logged to W&B. Set to 'none' to disable."
+        ),
     )
     parser.add_argument(
-        "--hard-sampling-prob",
-        type=float,
-        default=0.5,
-        help="Probability of using hard sampling (vs. uniform). Default 0.5 = 50/50 split.",
+        "--butterfly-n-estimators",
+        type=int,
+        default=1,
+        help="Number of TabICL estimators for butterfly evaluation. Default: 1.",
     )
-    parser.add_argument(
-        "--hard-sampling-device",
-        type=str,
-        choices=["cpu", "cuda"],
-        default="cpu",
-        help="Device for hard sampling similarity matrix computation.",
-    )
-    parser.add_argument("--sample-output-dir", type=Path, default=None, help="Optional directory to persist sampled datasets as .npz files.")
     parser.add_argument("--train-steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -241,7 +244,7 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
     parser.add_argument(
         "--hyper-encoder-type",
         type=str,
-        choices=["mlp", "attention"],
+        choices=["mlp", "attention", "attention_lda"],
         default="mlp",
         help="Context encoder used by spectral_hypernetwork.",
     )
@@ -261,6 +264,22 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         "--hyper-attn-use-pos-embed",
         action="store_true",
         help="Enable learned positional embeddings in attention spectral encoder.",
+    )
+    parser.add_argument(
+        "--no-hyper-svd-singular-value-scaling",
+        action="store_true",
+        help="Disable scaling SVD tokens by normalised singular values (attention / attention_lda).",
+    )
+    parser.add_argument(
+        "--no-hyper-lda-eigenvalue-scaling",
+        action="store_true",
+        help="Disable scaling LDA tokens by normalised discriminant eigenvalues (attention_lda only).",
+    )
+    parser.add_argument(
+        "--hyper-lda-regularization",
+        type=float,
+        default=1e-4,
+        help="Within-class scatter regularization strength for LDA (attention_lda only).",
     )
     parser.add_argument(
         "--disable-random-projection-init",
@@ -427,6 +446,8 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         raise ValueError("--hyper-attn-heads must be > 0")
     if args.hyper_attn_layers <= 0:
         raise ValueError("--hyper-attn-layers must be > 0")
+    if args.hyper_lda_regularization <= 0:
+        raise ValueError("--hyper-lda-regularization must be > 0")
     if args.head_hidden_dim <= 0:
         raise ValueError("--head-hidden-dim must be > 0")
     if not (0.0 < args.query_fraction_min < 1.0):
@@ -449,12 +470,6 @@ def parse_args() -> tuple[argparse.Namespace, ExtractConfig]:
         raise ValueError("--tabicl-train-shuffles must be > 0")
     if args.checkpoint_interval_steps <= 0:
         raise ValueError("--checkpoint-interval-steps must be > 0")
-    if args.enable_hard_sampling:
-        if not (0.0 < args.hard_sampling_temperature <= 1.0):
-            raise ValueError("--hard-sampling-temperature must be in (0, 1]")
-        if not (0.0 < args.hard_sampling_prob <= 1.0):
-            raise ValueError("--hard-sampling-prob must be in (0, 1]")
-
     splits = ["train", "val"] if args.split == "both" else [args.split]
     return args, ExtractConfig(
         data_dir=args.data_dir,
@@ -517,10 +532,7 @@ def main() -> None:
         max_cached_shards=args.max_cached_shards,
         sampler_backend=args.sampler_backend,
         sampling_distribution=args.sampling_distribution,
-        enable_hard_sampling=bool(args.enable_hard_sampling),
-        hard_sampling_temperature=args.hard_sampling_temperature,
-        hard_sampling_prob=args.hard_sampling_prob,
-        hard_sampling_device=args.hard_sampling_device,
+        cluster_file=args.cluster_file,
     )
 
     if args.mode == "sample-loop":
@@ -597,10 +609,7 @@ def main() -> None:
             max_cached_shards=args.max_cached_shards,
             sampler_backend=args.sampler_backend,
             sampling_distribution=args.sampling_distribution,
-            enable_hard_sampling=bool(args.enable_hard_sampling),
-            hard_sampling_temperature=args.hard_sampling_temperature,
-            hard_sampling_prob=args.hard_sampling_prob,
-            hard_sampling_device=args.hard_sampling_device,
+            cluster_file=args.cluster_file,
         )
         print(
             f"[info] Validation enabled: split={args.val_split} "
@@ -634,6 +643,9 @@ def main() -> None:
         hyper_attn_heads=args.hyper_attn_heads,
         hyper_attn_layers=args.hyper_attn_layers,
         hyper_attn_use_pos_embed=bool(args.hyper_attn_use_pos_embed),
+        hyper_svd_scale_by_singular_values=not bool(args.no_hyper_svd_singular_value_scaling),
+        hyper_lda_scale_by_eigenvalues=not bool(args.no_hyper_lda_eigenvalue_scaling),
+        hyper_lda_regularization=args.hyper_lda_regularization,
         use_random_projection_init=not bool(args.disable_random_projection_init),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         ortho_lambda=args.ortho_lambda,
@@ -645,6 +657,8 @@ def main() -> None:
         resume_training=bool(args.resume_training),
         checkpoint_interval_steps=args.checkpoint_interval_steps,
         effective_train_args=effective_train_args,
+        butterfly_features_dir=args.butterfly_features_dir,
+        butterfly_n_estimators=args.butterfly_n_estimators,
     )
 
     if args.train_output is not None:
@@ -668,6 +682,9 @@ def main() -> None:
                 "hyper_attn_heads": projection_meta.get("hyper_attn_heads"),
                 "hyper_attn_layers": projection_meta.get("hyper_attn_layers"),
                 "hyper_attn_use_pos_embed": projection_meta.get("hyper_attn_use_pos_embed"),
+                "hyper_svd_scale_by_singular_values": projection_meta.get("hyper_svd_scale_by_singular_values"),
+                "hyper_lda_scale_by_eigenvalues": projection_meta.get("hyper_lda_scale_by_eigenvalues"),
+                "hyper_lda_regularization": projection_meta.get("hyper_lda_regularization"),
                 "hyper_use_random_projection_init": projection_meta.get("hyper_use_random_projection_init"),
             },
         )

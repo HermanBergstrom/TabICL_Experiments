@@ -45,8 +45,4 @@ class SamplingConfig:
 	max_cached_shards: int
 	sampler_backend: str
 	sampling_distribution: str = "log-uniform"
-	enable_hard_sampling: bool = False
-	num_classes: int = 1000
-	hard_sampling_temperature: float = 0.1
-	hard_sampling_prob: float = 0.5
-	hard_sampling_device: str = "cpu"
+	cluster_file: Path | None = None

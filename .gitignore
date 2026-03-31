@@ -17,6 +17,8 @@ datasets.zip
 extracted_features.zip
 multimodal-embeddings-489820-03efef353fa6.json
 wandb/
+catboost_info/
+.claude/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

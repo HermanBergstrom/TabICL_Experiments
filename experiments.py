@@ -34,6 +34,7 @@ from sklearn.random_projection import GaussianRandomProjection
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.tree import DecisionTreeClassifier
 from tabicl import TabICLClassifier, TabICLRegressor
+from tabpfn import TabPFNClassifier, TabPFNRegressor
 from tqdm import tqdm
 from xgboost import XGBClassifier, XGBRegressor
 from skrub import TableVectorizer
@@ -106,7 +107,7 @@ DATASET_CONFIGS: dict[str, dict] = {
 
 DATASET_NAMES = list(DATASET_CONFIGS.keys())
 
-STANDARD_METHODS = ["tabicl", "decision_tree", "random_forest", "xgboost"]
+STANDARD_METHODS = ["tabicl", "tabpfn", "decision_tree", "random_forest", "xgboost"]
 PROBING_METHODS = ["linear_probe", "mlp"]
 ALL_METHODS = STANDARD_METHODS + PROBING_METHODS
 DIM_AUGMENTERS = ["none", "random_projection", "gaussian_append"]
@@ -893,6 +894,7 @@ def _build_standard_models(
 	if task == "regression":
 		models: dict[str, object] = {
 			"tabicl": TabICLRegressor(n_estimators=n_estimators, random_state=seed),
+			"tabpfn": TabPFNRegressor(random_state=seed),
 			"decision_tree": DecisionTreeRegressor(random_state=seed),
 			"random_forest": RandomForestRegressor(
 				n_estimators=100, random_state=seed, n_jobs=-1,
@@ -905,6 +907,7 @@ def _build_standard_models(
 	else:
 		models = {
 			"tabicl": TabICLClassifier(n_estimators=n_estimators, random_state=seed),
+			"tabpfn": TabPFNClassifier(random_state=seed),
 			"decision_tree": DecisionTreeClassifier(random_state=seed),
 			"random_forest": RandomForestClassifier(
 				n_estimators=100, random_state=seed, min_samples_split=10, n_jobs=-1,

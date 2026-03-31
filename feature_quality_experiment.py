@@ -22,6 +22,27 @@ try:
 except ImportError:
     TabICLClassifier = None
 
+try:
+    from xgboost import XGBClassifier
+except ImportError:
+    XGBClassifier = None
+
+try:
+    from catboost import CatBoostClassifier
+except ImportError:
+    CatBoostClassifier = None
+
+try:
+    from tabpfn import TabPFNClassifier
+except ImportError:
+    TabPFNClassifier = None
+
+try:
+    from tabpfn_factory import build_tabpfn_classifier, PreprocessingPreset
+    _tabpfn_factory_available = True
+except ImportError:
+    _tabpfn_factory_available = False
+
 
 class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -131,6 +152,125 @@ class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
         return (proba >= 0.5).astype(int)
 
 
+class TorchLogisticClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Sklearn-compatible binary logistic regression backed by PyTorch.
+
+    penalty='none' / C=inf  →  unregularized, solved with LBFGS
+    penalty='l2'             →  L2 regularization, solved with LBFGS
+    penalty='l1'             →  L1 regularization, solved with ISTA
+                                (proximal gradient with soft-thresholding)
+
+    Uses CUDA when available, falls back to CPU.
+    """
+
+    def __init__(self, penalty="l2", C=1.0, max_iter=200, random_state=42, device=None):
+        self.penalty = penalty
+        self.C = C
+        self.max_iter = max_iter
+        self.random_state = random_state
+        self.device = device
+
+    def fit(self, X, y):
+        if torch is None:
+            raise ImportError("PyTorch is required for TorchLogisticClassifier.")
+
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        self.classes_ = np.array([0, 1])
+        n_samples, n_features = X.shape
+
+        self.device_ = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(self.random_state)
+
+        X_t = torch.tensor(X, device=self.device_)
+        y_t = torch.tensor(y, device=self.device_)
+
+        no_reg = self.penalty in ("none", None) or self.C == np.inf
+        reg = 0.0 if no_reg else 1.0 / (self.C * n_samples)
+
+        if self.penalty == "l1" and not no_reg:
+            self.w_, self.b_ = self._fit_ista(X_t, y_t, l1_reg=reg)
+        else:
+            self.w_, self.b_ = self._fit_lbfgs(X_t, y_t, l2_reg=reg)
+
+        return self
+
+    def _fit_lbfgs(self, X_t, y_t, l2_reg):
+        n_features = X_t.shape[1]
+        w = torch.zeros(n_features, device=X_t.device, requires_grad=True)
+        b = torch.zeros(1, device=X_t.device, requires_grad=True)
+
+        optimizer = torch.optim.LBFGS(
+            [w, b],
+            max_iter=self.max_iter,
+            tolerance_grad=1e-6,
+            tolerance_change=1e-10,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                X_t @ w + b, y_t, reduction="mean"
+            )
+            if l2_reg > 0:
+                loss = loss + l2_reg * 0.5 * (w * w).sum()
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        return w.detach(), b.detach()
+
+    def _fit_ista(self, X_t, y_t, l1_reg):
+        n, p = X_t.shape
+
+        # Estimate Lipschitz constant via power iteration.
+        # For logistic loss, L = sigma_max(X)^2 / (4n).
+        with torch.no_grad():
+            v = torch.randn(p, device=X_t.device)
+            v = v / v.norm()
+            for _ in range(30):
+                v = X_t.T @ (X_t @ v)
+                sigma_sq = v.norm()
+                v = v / sigma_sq
+            L = float(sigma_sq) / (4 * n)
+
+        step = 1.0 / max(L, 1e-8)
+        threshold = step * l1_reg
+
+        w = torch.zeros(p, device=X_t.device)
+        b = torch.zeros(1, device=X_t.device)
+
+        for _ in range(self.max_iter * 10):
+            w_var = w.detach().requires_grad_(True)
+            b_var = b.detach().requires_grad_(True)
+
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                X_t @ w_var + b_var, y_t, reduction="mean"
+            )
+            loss.backward()
+
+            with torch.no_grad():
+                w_half = w - step * w_var.grad
+                w = torch.sign(w_half) * torch.clamp(w_half.abs() - threshold, min=0.0)
+                b = b - step * b_var.grad
+
+        return w, b
+
+    def predict_proba(self, X):
+        if not hasattr(self, "w_"):
+            raise RuntimeError("TorchLogisticClassifier must be fit before prediction.")
+        X = np.asarray(X, dtype=np.float32)
+        X_t = torch.tensor(X, device=self.device_)
+        with torch.no_grad():
+            p1 = torch.sigmoid(X_t @ self.w_ + self.b_).cpu().numpy().ravel()
+        return np.column_stack([1.0 - p1, p1])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
 def generate_base_data(n_samples=1000, n_informative=10, random_state=42):
     """
     Generates a clean, baseline dataset where ALL features are informative.
@@ -162,13 +302,15 @@ def inject_pure_noise(X, n_noise_features, random_state=42):
     return X_noisy
 
 
-def inject_low_rank_features(X, n_added_features, method='concatenate', random_state=42):
+def inject_low_rank_features(X, n_added_features, method='concatenate', only_projected=False, random_state=42):
     """
     Experiment 2: Injects low-rank features via random projection.
 
     Parameters:
     - method: 'concatenate' keeps original features and adds projections.
               'project' replaces original features with a higher-dim projection.
+    - only_projected: If True and method='concatenate', return only the projected
+                      features without the original features.
     """
     rng = np.random.default_rng(random_state)
     n_samples, n_orig_features = X.shape
@@ -181,8 +323,11 @@ def inject_low_rank_features(X, n_added_features, method='concatenate', random_s
         # Generate the redundant features
         redundant_features = np.dot(X, projection_matrix)
 
-        # Stack original features with redundant features
-        X_low_rank = np.hstack((X, redundant_features))
+        if only_projected:
+            X_low_rank = redundant_features
+        else:
+            # Stack original features with redundant features
+            X_low_rank = np.hstack((X, redundant_features))
 
     elif method == 'project':
         # Project original features into a strictly higher dimensional space
@@ -198,7 +343,7 @@ def inject_low_rank_features(X, n_added_features, method='concatenate', random_s
 
     return X_low_rank
 
-def inject_sparse_low_rank_features(X, n_added_features, nnz_per_feature=3, random_state=42):
+def inject_sparse_low_rank_features(X, n_added_features, nnz_per_feature=3, only_projected=False, random_state=42):
     """
     Injects low-rank features via a *sparse* random projection.
 
@@ -218,6 +363,8 @@ def inject_sparse_low_rank_features(X, n_added_features, nnz_per_feature=3, rand
     nnz_per_feature : int
         Number of non-zero weights per added feature (must be <=
         n_orig_features).
+    only_projected : bool
+        If True, return only the sparse projected features without the originals.
     random_state : int
     """
     rng = np.random.default_rng(random_state)
@@ -232,32 +379,39 @@ def inject_sparse_low_rank_features(X, n_added_features, nnz_per_feature=3, rand
         proj[chosen, j] = weights
 
     sparse_features = X @ proj  # (n_samples, n_added_features)
+    if only_projected:
+        return sparse_features
     return np.hstack((X, sparse_features))
 
 
-def inject_low_signal_features(X, y, n_weak_features, signal_strength=0.1, random_state=42):
+def inject_low_signal_features(X, y, n_weak_features, signal_strength=0.1, only_projected=False, random_state=42):
     """
     Experiment 3: Injects 'weak' features that have a slight correlation with y.
-    
+
     Parameters:
     - signal_strength: Float (0 to 1). Higher means more correlation with y.
                        At 0.1, the feature is mostly noise but has a slight 'lean'.
+    - only_projected: If True, return only the weak features without the originals.
     """
     rng = np.random.default_rng(random_state)
     n_samples = X.shape[0]
-    
+
     # Standardize y to use as a base for the signal (handles binary 0/1)
     y_signal = (y - np.mean(y)) / (np.std(y) + 1e-8)
-    
+
     weak_features = []
     for _ in range(n_weak_features):
         # Create a feature: signal_strength * target + (1 - signal_strength) * noise
         noise = rng.standard_normal(n_samples)
         feat = (signal_strength * y_signal) + ((1 - signal_strength) * noise)
         weak_features.append(feat.reshape(-1, 1))
-    
-    X_weak = np.hstack([X] + weak_features)
-    return X_weak
+
+    if only_projected:
+        return np.hstack(weak_features)
+    return np.hstack([X] + weak_features)
+
+
+ALL_STRATEGIES = ("noise", "low_rank", "sparse_low_rank", "low_signal")
 
 
 def build_experiment_datasets(
@@ -269,44 +423,73 @@ def build_experiment_datasets(
     sparse_nnz=3,
     low_signal_levels=(10, 50),
     signal_strength=0.1,
+    only_projected=False,
+    strategies=None,
     random_state=42,
 ):
     """
     Creates multiple feature-quality scenarios from the same base data.
+
+    Parameters
+    ----------
+    only_projected : bool
+        If True, the constructed (projected/weak) features are returned *without*
+        the original features — i.e. only the newly constructed columns.
+        Has no effect on the "noise" strategy (pure noise never includes signal).
+    strategies : sequence of str or None
+        Subset of strategies to build. Must be from ALL_STRATEGIES
+        ('noise', 'low_rank', 'sparse_low_rank', 'low_signal').
+        If None (default), all strategies are built.
     """
+    if strategies is None:
+        strategies = ALL_STRATEGIES
+    unknown = set(strategies) - set(ALL_STRATEGIES)
+    if unknown:
+        raise ValueError(f"Unknown strategies: {unknown}. Choose from {ALL_STRATEGIES}.")
+
     datasets = {"base": X_base}
 
-    for n_noise in noise_levels:
-        datasets[f"noise_{n_noise}"] = inject_pure_noise(
-            X_base,
-            n_noise_features=n_noise,
-            random_state=random_state,
-        )
+    if "noise" in strategies:
+        for n_noise in noise_levels:
+            datasets[f"noise_{n_noise}"] = inject_pure_noise(
+                X_base,
+                n_noise_features=n_noise,
+                random_state=random_state,
+            )
 
-    for n_added in low_rank_levels:
-        datasets[f"low_rank_concat_{n_added}"] = inject_low_rank_features(
-            X_base,
-            n_added_features=n_added,
-            method="concatenate",
-            random_state=random_state,
-        )
+    if "low_rank" in strategies:
+        key_prefix = "low_rank_proj" if only_projected else "low_rank_concat"
+        for n_added in low_rank_levels:
+            datasets[f"{key_prefix}_{n_added}"] = inject_low_rank_features(
+                X_base,
+                n_added_features=n_added,
+                method="concatenate",
+                only_projected=only_projected,
+                random_state=random_state,
+            )
 
-    for n_added in sparse_low_rank_levels:
-        datasets[f"sparse_low_rank_{n_added}"] = inject_sparse_low_rank_features(
-            X_base,
-            n_added_features=n_added,
-            nnz_per_feature=sparse_nnz,
-            random_state=random_state,
-        )
+    if "sparse_low_rank" in strategies:
+        key_prefix = "sparse_low_rank_proj" if only_projected else "sparse_low_rank"
+        for n_added in sparse_low_rank_levels:
+            datasets[f"{key_prefix}_{n_added}"] = inject_sparse_low_rank_features(
+                X_base,
+                n_added_features=n_added,
+                nnz_per_feature=sparse_nnz,
+                only_projected=only_projected,
+                random_state=random_state,
+            )
 
-    for n_weak in low_signal_levels:
-        datasets[f"low_signal_{n_weak}"] = inject_low_signal_features(
-            X_base,
-            y_base,
-            n_weak_features=n_weak,
-            signal_strength=signal_strength,
-            random_state=random_state,
-        )
+    if "low_signal" in strategies:
+        key_prefix = "low_signal_proj" if only_projected else "low_signal"
+        for n_weak in low_signal_levels:
+            datasets[f"{key_prefix}_{n_weak}"] = inject_low_signal_features(
+                X_base,
+                y_base,
+                n_weak_features=n_weak,
+                signal_strength=signal_strength,
+                only_projected=only_projected,
+                random_state=random_state,
+            )
 
     return datasets
 
@@ -361,31 +544,32 @@ def get_model_factories(random_state=42):
     """
     Returns callables that construct fresh model instances per run.
     """
+    _use_torch_lr = torch is not None
+
+    if _use_torch_lr:
+        _ur_clf = lambda: TorchLogisticClassifier(
+            penalty="none", max_iter=200, random_state=random_state
+        )
+        _l1_clf = lambda: TorchLogisticClassifier(
+            penalty="l1", C=1.0, max_iter=200, random_state=random_state
+        )
+    else:
+        _ur_clf = lambda: LogisticRegression(
+            max_iter=2000, solver="lbfgs", random_state=random_state, C=np.inf
+        )
+        _l1_clf = lambda: LogisticRegression(
+            penalty="elasticnet", l1_ratio=1.0, solver="saga",
+            max_iter=2000, random_state=random_state,
+        )
+
     factories = {
         "decision_tree": lambda: DecisionTreeClassifier(
             max_depth=6,
             min_samples_leaf=10,
             random_state=random_state,
         ),
-        "logistic_regression_ur": lambda: make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                max_iter=2000,
-                solver="lbfgs",
-                random_state=random_state,
-                C=np.inf
-            ),
-        ),
-        "logistic_regression_l1": lambda: make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                penalty="elasticnet",
-                l1_ratio=1.0,
-                solver="saga",
-                max_iter=4000,
-                random_state=random_state,
-            ),
-        ),
+        "logistic_regression_ur": lambda: make_pipeline(StandardScaler(), _ur_clf()),
+        "logistic_regression_l1": lambda: make_pipeline(StandardScaler(), _l1_clf()),
         "small_mlp": lambda: make_pipeline(
             StandardScaler(),
             TorchMLPClassifier(
@@ -399,15 +583,187 @@ def get_model_factories(random_state=42):
         ),
     }
 
+    if XGBClassifier is not None:
+        _xgb_use_gpu = torch is not None and torch.cuda.is_available()
+        if _xgb_use_gpu:
+            factories["xgboost"] = lambda: XGBClassifier(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                tree_method="hist",
+                device="cuda",
+                eval_metric="logloss",
+                random_state=random_state,
+                verbosity=0,
+            )
+        else:
+            factories["xgboost"] = lambda: XGBClassifier(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                tree_method="hist",
+                eval_metric="logloss",
+                random_state=random_state,
+                verbosity=0,
+            )
+
+    if CatBoostClassifier is not None:
+        _cb_use_gpu = torch is not None and torch.cuda.is_available()
+        factories["catboost"] = lambda: CatBoostClassifier(
+            iterations=500,
+            learning_rate=0.05,
+            depth=6,
+            task_type="GPU" if _cb_use_gpu else "CPU",
+            random_seed=random_state,
+            verbose=False,
+        )
+
+    if TabPFNClassifier is not None:
+        _tabpfn_device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+        if _tabpfn_factory_available:
+            for _preset in PreprocessingPreset:
+                factories[f"tabpfn_{_preset.value}"] = (
+                    lambda p=_preset, d=_tabpfn_device: build_tabpfn_classifier(
+                        preset=p, device=d, random_state=random_state
+                    )
+                )
+        else:
+            factories["tabpfn"] = lambda: TabPFNClassifier(
+                device=_tabpfn_device,
+                random_state=random_state,
+            )
+
     if TabICLClassifier is not None:
         factories["tabicl"] = lambda: TabICLClassifier(
             random_state=random_state,
             device="cuda",
             verbose=False,
-            n_estimators=1,
+            #n_estimators=16,
         )
 
     return factories
+
+
+def _entropy_effective_n(weights, n_features):
+    """Shared helper: entropy-based effective-n from a weight vector."""
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = weights[weights > 0]
+    if len(weights) == 0:
+        return 1.0, 1.0 / n_features
+    p = weights / weights.sum()
+    effective_n = float(np.exp(-np.sum(p * np.log(p))))
+    return effective_n, effective_n / n_features
+
+
+def compute_signal_imbalance(X, y, random_state=42):
+    """
+    Estimates signal imbalance across features using decision tree importances.
+
+    Fits a decision tree on (X, y) and treats the resulting feature importances
+    as a probability distribution. Computes the entropy-based effective number
+    of predictive features:
+
+        effective_n = exp(-sum(p_i * log(p_i)))
+
+    where p_i is the normalized importance of feature i (zero-importance
+    features are excluded).
+
+    Returns
+    -------
+    effective_n : float
+        Ranges from 1 (all signal concentrated in one feature) to n_features
+        (signal spread perfectly uniformly).
+    normalized_effective_n : float
+        effective_n / n_features. Comparable across datasets of different widths.
+    """
+    tree = DecisionTreeClassifier(
+        max_depth=10,
+        min_samples_leaf=5,
+        random_state=random_state,
+    )
+    tree.fit(X, y)
+    return _entropy_effective_n(tree.feature_importances_, X.shape[1])
+
+
+def compute_signal_imbalance_lr(X, y, random_state=42):
+    """
+    Estimates signal imbalance using L2-regularized logistic regression coefficients.
+
+    Scales X then treats |coef_| as per-feature importance, applying the same
+    entropy-based effective-n formula as compute_signal_imbalance.  L2
+    regularization keeps all features non-zero, giving a smoother estimate than
+    L1.  Uses a PyTorch/LBFGS GPU implementation when CUDA is available, falling
+    back to sklearn on CPU otherwise.
+
+    Returns
+    -------
+    effective_n : float
+    normalized_effective_n : float
+    """
+    if torch is not None and torch.cuda.is_available():
+        return _compute_signal_imbalance_lr_torch(X, y, random_state)
+    return _compute_signal_imbalance_lr_sklearn(X, y, random_state)
+
+
+def _compute_signal_imbalance_lr_sklearn(X, y, random_state=42):
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    lr = LogisticRegression(
+        penalty="l2",
+        solver="lbfgs",
+        max_iter=2000,
+        random_state=random_state,
+    )
+    lr.fit(X_scaled, y)
+    importances = np.abs(lr.coef_).sum(axis=0)
+    return _entropy_effective_n(importances, X.shape[1])
+
+
+def _compute_signal_imbalance_lr_torch(X, y, random_state=42):
+    device = "cuda"
+    n_samples, n_features = X.shape
+
+    # Standardize on CPU before moving to GPU.
+    mean = X.mean(axis=0)
+    std = X.std(axis=0) + 1e-8
+    X_scaled = ((X - mean) / std).astype(np.float32)
+
+    X_t = torch.tensor(X_scaled, device=device)
+    y_t = torch.tensor(y, dtype=torch.float32, device=device)
+
+    torch.manual_seed(random_state)
+    w = torch.zeros(n_features, device=device, requires_grad=True)
+    b = torch.zeros(1, device=device, requires_grad=True)
+
+    # L2 penalty scaled to match sklearn's C=1: (1/N) * ||w||^2 / 2
+    l2_scale = 1.0 / n_samples
+
+    optimizer = torch.optim.LBFGS(
+        [w, b],
+        max_iter=200,
+        tolerance_grad=1e-5,
+        tolerance_change=1e-9,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        logits = X_t @ w + b
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, y_t, reduction="mean"
+        )
+        l2 = l2_scale * 0.5 * (w * w).sum()
+        (loss + l2).backward()
+        return loss + l2
+
+    optimizer.step(closure)
+
+    importances = w.detach().abs().cpu().numpy()
+    return _entropy_effective_n(importances, n_features)
 
 
 def evaluate_models_on_dataset(X, y, model_factories, random_state=42, test_size=0.3):
@@ -512,6 +868,10 @@ def save_results_csv(
 
     fieldnames = [
         "seed",
+        "signal_imbalance_dt",
+        "normalized_signal_imbalance_dt",
+        "signal_imbalance_lr",
+        "normalized_signal_imbalance_lr",
         "dataset",
         "model",
         "accuracy",
@@ -649,6 +1009,35 @@ if __name__ == "__main__":
         default=Path("results"),
         help="Directory where results will be saved.",
     )
+    parser.add_argument(
+        "--only-projected",
+        action="store_true",
+        help=(
+            "Return only the constructed (projected/weak) features, without "
+            "concatenating the original features. No effect on the 'noise' strategy."
+        ),
+    )
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        choices=list(ALL_STRATEGIES),
+        default=None,
+        metavar="STRATEGY",
+        help=(
+            f"Subset of strategies to run. Choices: {list(ALL_STRATEGIES)}. "
+            "If omitted, all strategies are run."
+        ),
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Subset of models to evaluate (e.g. --models tabpfn_default tabpfn_no_svd xgboost). "
+            "If omitted, all available models are run."
+        ),
+    )
     args = parser.parse_args()
 
     n_informative_base = args.n_informative
@@ -677,15 +1066,24 @@ if __name__ == "__main__":
             random_state=seed,
         )
 
+        signal_imbalance_dt, normalized_signal_imbalance_dt = compute_signal_imbalance(
+            X_base, y_base, random_state=seed
+        )
+        signal_imbalance_lr, normalized_signal_imbalance_lr = compute_signal_imbalance_lr(
+            X_base, y_base, random_state=seed
+        )
+
         datasets = build_experiment_datasets(
             X_base,
             y_base,
-            noise_levels=(50, 100, 200, 400, 2000),
-            low_rank_levels=(50, 100, 200, 400, 1000, 2000),
-            sparse_low_rank_levels=(50, 100, 200, 400, 1000, 2000),
+            noise_levels=(200, 400, 2000),
+            low_rank_levels=(100, 250, 500, 1000),
+            sparse_low_rank_levels=(200, 400, 1000, 2000),
             sparse_nnz=3,
-            low_signal_levels=(50, 100, 200, 400, 1000, 2000),
+            low_signal_levels=(200, 400, 1000, 2000),
             signal_strength=0.01,
+            only_projected=args.only_projected,
+            strategies=args.strategies,
             random_state=seed,
         )
 
@@ -725,8 +1123,22 @@ if __name__ == "__main__":
             eval_desc = f"Seed {seed}: all datasets"
 
         model_factories = get_model_factories(random_state=seed)
-        if seed_idx == 0 and TabICLClassifier is None:
-            print("Warning: tabicl is not installed. Skipping TabICL.")
+        if args.models is not None:
+            unknown_models = set(args.models) - set(model_factories)
+            if unknown_models:
+                print(f"Warning: unknown model(s) requested: {sorted(unknown_models)}. "
+                      f"Available: {sorted(model_factories)}")
+            model_factories = {k: v for k, v in model_factories.items() if k in args.models}
+        if seed_idx == 0:
+            if TabICLClassifier is None:
+                print("Warning: tabicl is not installed. Skipping TabICL.")
+            if XGBClassifier is None:
+                print("Warning: xgboost is not installed. Skipping XGBoost.")
+            if CatBoostClassifier is None:
+                print("Warning: catboost is not installed. Skipping CatBoost.")
+            if TabPFNClassifier is None:
+                print("Warning: tabpfn is not installed. Skipping TabPFN.")
+            print(f"Running models: {list(model_factories)}")
 
         seed_results = []
         for dataset_name, X_data in tqdm(
@@ -742,6 +1154,10 @@ if __name__ == "__main__":
             )
             for row in dataset_results:
                 row["seed"] = seed
+                row["signal_imbalance_dt"] = signal_imbalance_dt
+                row["normalized_signal_imbalance_dt"] = normalized_signal_imbalance_dt
+                row["signal_imbalance_lr"] = signal_imbalance_lr
+                row["normalized_signal_imbalance_lr"] = normalized_signal_imbalance_lr
                 row["dataset"] = dataset_name
             seed_results.extend(dataset_results)
 

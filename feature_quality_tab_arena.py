@@ -12,8 +12,11 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from feature_quality_experiment import (
+    ALL_STRATEGIES,
     build_experiment_datasets,
     build_reduced_datasets,
+    compute_signal_imbalance,
+    compute_signal_imbalance_lr,
     get_model_factories,
     print_results_table,
 )
@@ -34,6 +37,10 @@ RESULT_FIELDNAMES = [
     "fit_seconds",
     "predict_seconds",
     "normalized_effective_rank",
+    "signal_imbalance_dt",
+    "normalized_signal_imbalance_dt",
+    "signal_imbalance_lr",
+    "normalized_signal_imbalance_lr",
     "n_original_features",
     "train_pos_count",
     "train_neg_count",
@@ -229,6 +236,8 @@ def build_split_datasets(
     y_test,
     seed,
     reduction_only=False,
+    only_projected=False,
+    strategies=None,
 ):
     """
     Builds feature-quality variants while preserving the provided split.
@@ -240,10 +249,12 @@ def build_split_datasets(
     datasets_full = build_experiment_datasets(
         X_full,
         y_full,
-        noise_levels=(50, 100, 200, 400, 2000),
-        low_rank_levels=(50, 100, 200, 400, 1000, 2000),
-        low_signal_levels=(50, 100, 200, 400, 1000, 2000),
+        noise_levels=(100, 200, 400, 2000),
+        low_rank_levels=(100, 200, 400, 1000, 2000),
+        low_signal_levels=(100, 200, 400, 1000, 2000),
         signal_strength=0.01,
+        only_projected=only_projected,
+        strategies=strategies,
         random_state=seed,
     )
     reduced_full = build_reduced_datasets(
@@ -322,13 +333,13 @@ def parse_args():
     parser.add_argument(
         "--max-train-samples",
         type=int,
-        default=1000,
+        default=2000,
         help="Cap train rows per fold to keep runtime manageable.",
     )
     parser.add_argument(
         "--max-test-samples",
         type=int,
-        default=200,
+        default=400,
         help="Cap test rows per fold to keep runtime manageable.",
     )
     parser.add_argument(
@@ -339,6 +350,38 @@ def parse_args():
             "Number of seeds to run per task. Defaults to the total number of "
             "available (repeat, fold) splits. If larger than the available splits, "
             "splits are reused with a different subsampling seed."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="Only run tasks whose dataset name contains this substring (case-insensitive).",
+    )
+    parser.add_argument(
+        "--drop-columns",
+        nargs="+",
+        default=None,
+        metavar="COL",
+        help="Drop these raw columns before vectorization (e.g. --drop-columns state).",
+    )
+    parser.add_argument(
+        "--only-projected",
+        action="store_true",
+        help=(
+            "Return only the constructed (projected/weak) features, without "
+            "concatenating the original features. No effect on the 'noise' strategy."
+        ),
+    )
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        choices=list(ALL_STRATEGIES),
+        default=None,
+        metavar="STRATEGY",
+        help=(
+            f"Subset of strategies to run. Choices: {list(ALL_STRATEGIES)}. "
+            "If omitted, all strategies are run."
         ),
     )
     return parser.parse_args()
@@ -356,6 +399,10 @@ def tab_arena_test(args):
         if not task_ids:
             raise ValueError(f"Task ID {args.task_id} is not part of tabarena-v0.1")
 
+    if args.dataset_name is not None:
+        print(f"Filtering tasks to dataset names containing: '{args.dataset_name}'")
+    if args.drop_columns:
+        print(f"Dropping columns before vectorization: {args.drop_columns}")
     print("Getting data for TabArena tasks...")
     if args.lite:
         print("TabArena Lite is enabled. Using first repeat of first fold only.")
@@ -382,13 +429,27 @@ def tab_arena_test(args):
         if task_csv_path.exists() and not args.dry_run:
             task_csv_path.unlink()
 
-        if dataset.qualities["NumberOfClasses"] != 2:
-            print(f"Skipping task {task.id}: regression or multi-class.")
+        if args.dataset_name is not None and args.dataset_name.lower() not in dataset.name.lower():
             continue
 
-        if dataset.qualities["NumberOfFeatures"] > 500:
-            print(f"Skipping task {task.id}: more than 500 features.")
+        #Only skip regression
+        if dataset.qualities["NumberOfClasses"] == 0 or dataset.qualities["NumberOfClasses"] > 100:
+            print(f"Skipping task {task.id}: regression.")
             continue
+
+        #if dataset.qualities["NumberOfClasses"] != 2:
+        #    print(f"Skipping task {task.id}: regression or multi-class.")
+        #    continue
+
+
+        if dataset.qualities["NumberOfFeatures"] > 1000:
+            print(f"Skipping task {task.id}: more than 1000 features.")
+            continue
+
+        #if dataset.qualities["NumberOfFeatures"] < 5:
+        #    print(f"Skipping task {task.id}: fewer than 5 features.")
+        #    continue
+
 
         minority_ratio = dataset.qualities.get("MinorityClassSize") / (
             dataset.qualities.get("MajorityClassSize")
@@ -436,6 +497,12 @@ def tab_arena_test(args):
             x_test = x.iloc[test_indices]
             y_test = y.iloc[test_indices]
 
+            if args.drop_columns:
+                cols_to_drop = [c for c in args.drop_columns if c in x_train.columns]
+                if cols_to_drop:
+                    x_train = x_train.drop(columns=cols_to_drop)
+                    x_test = x_test.drop(columns=cols_to_drop)
+
             pos_class = task.class_labels[1]
             if pos_class == "True":
                 pos_class = True
@@ -466,6 +533,17 @@ def tab_arena_test(args):
             imputer = SimpleImputer(strategy="constant", fill_value=0.0)
             scaler = StandardScaler()
             X_train_vectorized = vectorizer.fit_transform(x_train)
+
+            _debug_datasets = ()
+            if any(name in dataset.name.lower() for name in _debug_datasets):
+                cols = vectorizer.get_feature_names_out().tolist()
+                print(
+                    f"\n[DEBUG] {dataset.name} | seed={seed} repeat={repeat} fold={fold}"
+                    f" | {len(cols)} columns after vectorization:"
+                )
+                for col in cols:
+                    print(f"  {col}")
+
             X_train_imputed = imputer.fit_transform(X_train_vectorized)
             X_train_normalized = scaler.fit_transform(X_train_imputed)
 
@@ -490,6 +568,8 @@ def tab_arena_test(args):
                 y_test=y_test_binary,
                 seed=seed,
                 reduction_only=args.reduction_only,
+                only_projected=args.only_projected,
+                strategies=args.strategies,
             )
 
             try:
@@ -499,6 +579,22 @@ def tab_arena_test(args):
             except Exception as e:
                 print(f"Error computing normalized effective rank: {e}")
                 continue
+
+            try:
+                signal_imbalance_dt, normalized_signal_imbalance_dt = (
+                    compute_signal_imbalance(X_train_normalized, y_train_binary, random_state=seed)
+                )
+            except Exception as e:
+                print(f"Error computing signal imbalance (DT): {e}")
+                signal_imbalance_dt, normalized_signal_imbalance_dt = np.nan, np.nan
+
+            try:
+                signal_imbalance_lr, normalized_signal_imbalance_lr = (
+                    compute_signal_imbalance_lr(X_train_normalized, y_train_binary, random_state=seed)
+                )
+            except Exception as e:
+                print(f"Error computing signal imbalance (LR): {e}")
+                signal_imbalance_lr, normalized_signal_imbalance_lr = np.nan, np.nan
 
             print(
                 f"Task {task.id} | seed {seed_idx + 1}/{num_seeds} "
@@ -517,6 +613,7 @@ def tab_arena_test(args):
                 continue
 
             model_factories = get_model_factories(random_state=seed)
+            seed_results = []
             for variant_name, (X_variant_train, X_variant_test) in tqdm(
                 split_datasets.items(),
                 desc=f"Task {task.id} seed {seed_idx + 1}/{num_seeds}",
@@ -542,6 +639,10 @@ def tab_arena_test(args):
                             "seed": seed,
                             "variant": variant_name,
                             "normalized_effective_rank": normalized_effective_rank_base,
+                            "signal_imbalance_dt": signal_imbalance_dt,
+                            "normalized_signal_imbalance_dt": normalized_signal_imbalance_dt,
+                            "signal_imbalance_lr": signal_imbalance_lr,
+                            "normalized_signal_imbalance_lr": normalized_signal_imbalance_lr,
                             "n_original_features": n_original_features,
                             "train_pos_count": train_balance["n_pos"],
                             "train_neg_count": train_balance["n_neg"],
@@ -554,6 +655,13 @@ def tab_arena_test(args):
                     )
                     all_results.append(row)
                     task_results.append(row)
+                    seed_results.append(row)
+
+            append_results_csv(seed_results, task_csv_path)
+            print(
+                f"Checkpoint saved for task {task.id} seed {seed_idx + 1}/{num_seeds}: "
+                f"{len(seed_results)} rows -> {task_csv_path}"
+            )
 
         if args.dry_run:
             if successful_splits > 0:
@@ -578,9 +686,8 @@ def tab_arena_test(args):
             else:
                 print(f"Dry-run rejected task {task.id}: no successful splits.")
         else:
-            append_results_csv(task_results, task_csv_path)
             print(
-                f"Checkpoint saved for task {task.id}: {len(task_results)} rows -> {task_csv_path}"
+                f"Task {task.id} complete: {len(task_results)} total rows saved to {task_csv_path}"
             )
 
     if args.dry_run:

@@ -9,15 +9,28 @@ import matplotlib.pyplot as plt
 
 LEGEND_FONT_SIZE = 13
 
+MODEL_DISPLAY_NAMES = {
+    "decision_tree": "Decision Tree",
+    "logistic_regression_ur": "Logistic Reg. (unregularized)",
+    "logistic_regression_l1": "Logistic Reg. (L1)",
+    "small_mlp": "MLP",
+    "xgboost": "XGBoost",
+    "catboost": "CatBoost",
+    "tabpfn": "TabPFN",
+    "tabicl": "TabICL",
+}
+
 INJECTION_PREFIXES = {
-    "noise": "noise_",
-    "low_rank": "low_rank_concat_",
-    "low_signal": "low_signal_",
+    "noise": ["noise_"],
+    "low_rank": ["low_rank_concat_", "low_rank_proj_"],
+    "sparse_low_rank": ["sparse_low_rank_", "sparse_low_rank_proj_"],
+    "low_signal": ["low_signal_", "low_signal_proj_"],
 }
 
 INJECTION_TITLES = {
     "noise": "Pure Noise Features",
     "low_rank": "Low-Rank Features",
+    "sparse_low_rank": "Sparse Low-Rank Features",
     "low_signal": "Low-Signal Features",
 }
 
@@ -49,10 +62,11 @@ def parse_dataset_name(dataset_name, method_hint=None):
         return method, "base", 0
 
     # Parse injection type and count
-    for injection_type, prefix in INJECTION_PREFIXES.items():
-        if remainder.startswith(prefix):
-            n_added = int(remainder.removeprefix(prefix))
-            return method, injection_type, n_added
+    for injection_type, prefixes in INJECTION_PREFIXES.items():
+        for prefix in prefixes:
+            if remainder.startswith(prefix):
+                n_added = int(remainder.removeprefix(prefix))
+                return method, injection_type, n_added
 
     return None, None, None
 
@@ -89,22 +103,10 @@ def load_all_results(csv_normal, csv_pca, csv_rp):
     Load results from all three CSV files and organize by method and injection type.
     Supports aggregation across multiple seed files.
     """
+    all_injection_types = list(INJECTION_PREFIXES.keys())
     data = {
-        "no_reduction": {
-            "noise": defaultdict(list),
-            "low_rank": defaultdict(list),
-            "low_signal": defaultdict(list),
-        },
-        "pca": {
-            "noise": defaultdict(list),
-            "low_rank": defaultdict(list),
-            "low_signal": defaultdict(list),
-        },
-        "rp": {
-            "noise": defaultdict(list),
-            "low_rank": defaultdict(list),
-            "low_signal": defaultdict(list),
-        },
+        method: {inj: defaultdict(list) for inj in all_injection_types}
+        for method in ("no_reduction", "pca", "rp")
     }
 
     base_points = {
@@ -208,7 +210,8 @@ def plot_injection_type(
         y = [p[1] for p in points]
         if not x:
             continue
-        ax.plot(x, y, marker="o", linewidth=2, label=model_name)
+        display_name = MODEL_DISPLAY_NAMES.get(model_name, model_name)
+        ax.plot(x, y, marker="o", linewidth=2, label=display_name)
 
     # Reference line
     ax.axvline(
@@ -256,10 +259,16 @@ def plot_injection_type(
 
 def make_per_method_plots(data, output_dir, n_informative_features):
     """Create one 3-panel figure for each reduction method."""
-    injection_types = ["noise", "low_rank", "low_signal"]
+    injection_types = [
+        inj for inj in INJECTION_PREFIXES
+        if any(data[m][inj] for m in data)
+    ]
 
     for method in ["no_reduction", "pca", "rp"]:
-        fig, axes = plt.subplots(1, 3, figsize=(20, 5), sharey=True)
+        n_inj = len(injection_types)
+        fig, axes = plt.subplots(1, n_inj, figsize=(7 * n_inj, 5), sharey=True)
+        if n_inj == 1:
+            axes = [axes]
 
         for ax, injection_type in zip(axes, injection_types):
             plot_injection_type(
@@ -303,15 +312,23 @@ def make_per_method_plots(data, output_dir, n_informative_features):
 
 
 def make_joint_comparison_plot(data, output_dir, n_informative_features):
-    """Create a 3x3 joint plot: rows=injections, cols=methods."""
-    injection_types = ["noise", "low_rank", "low_signal"]
+    """Create an NxM joint plot: rows=injections, cols=methods."""
+    injection_types = [
+        inj for inj in INJECTION_PREFIXES
+        if any(data[m][inj] for m in data)
+    ]
     methods = ["no_reduction", "pca", "rp"]
 
-    fig, axes = plt.subplots(3, 3, figsize=(20, 15), sharey="row")
+    n_rows, n_cols = len(injection_types), len(methods)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows), sharey="row")
+    if n_rows == 1:
+        axes = [axes]
+    if n_cols == 1:
+        axes = [[row] for row in axes]
 
     for row_idx, injection_type in enumerate(injection_types):
         for col_idx, method in enumerate(methods):
-            ax = axes[row_idx, col_idx]
+            ax = axes[row_idx][col_idx]
             
             plot_injection_type(
                 ax,
@@ -333,7 +350,7 @@ def make_joint_comparison_plot(data, output_dir, n_informative_features):
                 ax.set_ylabel("")
 
     # Shared legend positioned between title and top subplot row.
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(
         handles,
         labels,
@@ -362,7 +379,7 @@ def make_joint_comparison_plot(data, output_dir, n_informative_features):
     # Row headings aligned to the actual subplot row centers.
     fig.canvas.draw()
     for row_idx, injection_type in enumerate(injection_types):
-        row_ax = axes[row_idx, 0]
+        row_ax = axes[row_idx][0]
         bbox = row_ax.get_position()
         y_center = (bbox.y0 + bbox.y1) / 2.0
         fig.text(
@@ -479,9 +496,8 @@ def main():
     print(f"Joint comparison figure: {joint_path}")
     print()
     print("Generated files:")
-    print(f"  - feature_quality_no_reduction_all_injections.png")
-    print(f"  - feature_quality_pca_all_injections.png")
-    print(f"  - feature_quality_rp_all_injections.png")
+    for m in ["no_reduction", "pca", "rp"]:
+        print(f"  - feature_quality_{m}_all_injections.png")
     print(f"  - feature_quality_joint_comparison.png")
 
 

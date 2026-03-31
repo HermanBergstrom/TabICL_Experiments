@@ -52,6 +52,7 @@ def project_episode_features(
 	features: torch.Tensor,
 	support_indices: torch.Tensor,
 	zca_epsilon: float,
+	support_labels: torch.Tensor | None = None,
 	return_projection_matrix: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
 	"""Project all rows in an episode for a given projection method."""
@@ -75,6 +76,7 @@ def project_episode_features(
 		projected = module(
 			features=features,
 			support_indices=support_indices,
+			support_labels=support_labels,
 			return_projection_matrix=return_projection_matrix,
 		)
 		return projected
@@ -146,6 +148,9 @@ def build_projection_module(
 	hyper_attn_heads: int,
 	hyper_attn_layers: int,
 	hyper_attn_use_pos_embed: bool,
+	hyper_svd_scale_by_singular_values: bool = True,
+	hyper_lda_scale_by_eigenvalues: bool = True,
+	hyper_lda_regularization: float = 1e-4,
 	use_random_projection_init: bool,
 	device: torch.device,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
@@ -159,8 +164,8 @@ def build_projection_module(
 		raise ValueError("zca_epsilon must be > 0")
 	if hyper_top_k <= 0:
 		raise ValueError("hyper_top_k must be > 0")
-	if hyper_encoder_type not in {"mlp", "attention"}:
-		raise ValueError("hyper_encoder_type must be one of ['mlp', 'attention']")
+	if hyper_encoder_type not in {"mlp", "attention", "attention_lda"}:
+		raise ValueError("hyper_encoder_type must be one of ['mlp', 'attention', 'attention_lda']")
 	if hyper_attn_heads <= 0:
 		raise ValueError("hyper_attn_heads must be > 0")
 	if hyper_attn_layers <= 0:
@@ -177,6 +182,9 @@ def build_projection_module(
 			attention_num_heads=int(hyper_attn_heads),
 			attention_num_layers=int(hyper_attn_layers),
 			attention_use_positional_embeddings=bool(hyper_attn_use_pos_embed),
+			svd_scale_by_singular_values=bool(hyper_svd_scale_by_singular_values),
+			lda_scale_by_eigenvalues=bool(hyper_lda_scale_by_eigenvalues),
+			lda_regularization=float(hyper_lda_regularization),
 			use_random_projection_init=bool(use_random_projection_init),
 		).to(device)
 	elif method == "vanilla_hypernetwork":
@@ -215,6 +223,9 @@ def build_projection_module(
 		"hyper_attn_heads": int(hyper_attn_heads),
 		"hyper_attn_layers": int(hyper_attn_layers),
 		"hyper_attn_use_pos_embed": bool(hyper_attn_use_pos_embed),
+		"hyper_svd_scale_by_singular_values": bool(hyper_svd_scale_by_singular_values),
+		"hyper_lda_scale_by_eigenvalues": bool(hyper_lda_scale_by_eigenvalues),
+		"hyper_lda_regularization": float(hyper_lda_regularization),
 		"hyper_use_random_projection_init": bool(use_random_projection_init),
 	}
 	return module, meta

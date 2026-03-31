@@ -22,6 +22,7 @@ except ImportError:
 
 from finetune_projection_head import FrozenTabICLConfig, build_frozen_tabicl_backbone
 
+from .butterfly_eval import ButterflyEvaluator
 from .config import SamplingConfig
 from .episodes import class_safe_support_query_indices, remap_labels_from_support
 from .projection_methods import build_projection_module, project_episode_features
@@ -56,6 +57,9 @@ def train_projection_head_with_sampler(
 	hyper_attn_heads: int = 4,
 	hyper_attn_layers: int = 2,
 	hyper_attn_use_pos_embed: bool = False,
+	hyper_svd_scale_by_singular_values: bool = True,
+	hyper_lda_scale_by_eigenvalues: bool = True,
+	hyper_lda_regularization: float = 1e-4,
 	use_random_projection_init: bool = True,
 	gradient_accumulation_steps: int = 1,
 	ortho_lambda: float = 0.01,
@@ -67,6 +71,8 @@ def train_projection_head_with_sampler(
 	resume_training: bool = False,
 	checkpoint_interval_steps: int = 50,
 	effective_train_args: dict[str, Any] | None = None,
+	butterfly_features_dir: Path | None = None,
+	butterfly_n_estimators: int = 1,
 ) -> tuple[torch.nn.Module, dict[str, list[float]], dict[str, Any]]:
 	"""Train projection module with one sampled dataset per optimization step."""
 	if num_steps <= 0:
@@ -149,6 +155,9 @@ def train_projection_head_with_sampler(
 				"hyper_attn_heads": int(hyper_attn_heads),
 				"hyper_attn_layers": int(hyper_attn_layers),
 				"hyper_attn_use_pos_embed": bool(hyper_attn_use_pos_embed),
+				"hyper_svd_scale_by_singular_values": bool(hyper_svd_scale_by_singular_values),
+				"hyper_lda_scale_by_eigenvalues": bool(hyper_lda_scale_by_eigenvalues),
+				"hyper_lda_regularization": float(hyper_lda_regularization),
 				"use_random_projection_init": bool(use_random_projection_init),
 				"sampling_min_dataset_size": int(sampling_config.min_dataset_size),
 				"sampling_max_dataset_size": int(sampling_config.max_dataset_size),
@@ -157,10 +166,7 @@ def train_projection_head_with_sampler(
 				"sampling_min_per_class": int(sampling_config.min_per_class),
 				"sampling_distribution": str(sampling_config.sampling_distribution),
 				"sampling_backend": str(sampling_config.sampler_backend),
-				"enable_hard_sampling": bool(sampling_config.enable_hard_sampling),
-				"hard_sampling_temperature": float(sampling_config.hard_sampling_temperature),
-				"hard_sampling_prob": float(sampling_config.hard_sampling_prob),
-				"hard_sampling_device": str(sampling_config.hard_sampling_device),
+				"cluster_file": str(sampling_config.cluster_file) if sampling_config.cluster_file is not None else None,
 			},
 		}
 		if resume_wandb_id is not None:
@@ -199,26 +205,40 @@ def train_projection_head_with_sampler(
 		return time.perf_counter()
 
 	enable_attention_spectral_timers = (
-		projection_method == "spectral_hypernetwork" and hyper_encoder_type == "attention"
+		projection_method == "spectral_hypernetwork" and hyper_encoder_type in {"attention", "attention_lda"}
 	)
 	if enable_attention_spectral_timers:
 		print("[info] Attention-spectral timing enabled: eigendecomp, hypernetwork encoder/decoder, TabICL forward")
 
-	heldout_classes: set[int] = set()
-	if val_heldout_classes_count is not None and val_heldout_classes_count > 0:
-		temp_sampler = ShardedEmbeddingSampler(
+	# For preload backend: load the training split once and share the tensor across
+	# all samplers that use the same split, avoiding redundant I/O and memory copies.
+	train_preloaded: tuple[torch.Tensor, dict[int, list[int]]] | None = None
+	if sampling_config.sampler_backend == "preload":
+		print("[info] Pre-loading shard data (shared across all samplers)...", flush=True)
+		train_preloaded = ShardedEmbeddingSampler.preload_from_disk(
 			output_dir=sampling_config.output_dir,
 			split=sampling_config.split,
-			seed=sampling_config.seed,
-			max_cached_shards=sampling_config.max_cached_shards,
-			sampler_backend=sampling_config.sampler_backend,
 		)
-		all_available = temp_sampler.available_classes
+
+	heldout_classes: set[int] = set()
+	if val_heldout_classes_count is not None and val_heldout_classes_count > 0:
+		if train_preloaded is not None:
+			# Class list is available immediately from the preloaded index.
+			all_available = sorted(train_preloaded[1].keys())
+		else:
+			temp_sampler = ShardedEmbeddingSampler(
+				output_dir=sampling_config.output_dir,
+				split=sampling_config.split,
+				seed=sampling_config.seed,
+				max_cached_shards=sampling_config.max_cached_shards,
+				sampler_backend=sampling_config.sampler_backend,
+			)
+			all_available = temp_sampler.available_classes
+			del temp_sampler
 		n_to_holdout = min(val_heldout_classes_count, len(all_available) - 2)
 		heldout_rng = np.random.default_rng(sampling_config.seed + 999)
 		heldout_classes = set(heldout_rng.choice(all_available, size=n_to_holdout, replace=False).tolist())
 		print(f"[info] Held-out {len(heldout_classes)} classes for validation on unseen classes")
-		del temp_sampler
 
 	sampler = ShardedEmbeddingSampler(
 		output_dir=sampling_config.output_dir,
@@ -227,25 +247,27 @@ def train_projection_head_with_sampler(
 		max_cached_shards=sampling_config.max_cached_shards,
 		sampler_backend=sampling_config.sampler_backend,
 		excluded_classes=heldout_classes,
-		enable_hard_sampling=sampling_config.enable_hard_sampling,
-		num_classes=sampling_config.num_classes,
-		hard_sampling_temperature=sampling_config.hard_sampling_temperature,
-		hard_sampling_prob=sampling_config.hard_sampling_prob,
-		hard_sampling_device=sampling_config.hard_sampling_device,
+		cluster_file=sampling_config.cluster_file,
+		preloaded_data=train_preloaded,
 	)
 	split_rng = np.random.default_rng(sampling_config.seed + 7)
 	if val_sampling_config is not None and val_every > 0:
+		# Reuse the preloaded tensor when the val split matches the training split.
+		val_preloaded = (
+			train_preloaded
+			if (train_preloaded is not None
+				and val_sampling_config.split == sampling_config.split
+				and val_sampling_config.output_dir == sampling_config.output_dir)
+			else None
+		)
 		val_sampler = ShardedEmbeddingSampler(
 			output_dir=val_sampling_config.output_dir,
 			split=val_sampling_config.split,
 			seed=val_sampling_config.seed,
 			max_cached_shards=val_sampling_config.max_cached_shards,
 			sampler_backend=val_sampling_config.sampler_backend,
-			enable_hard_sampling=val_sampling_config.enable_hard_sampling,
-			num_classes=val_sampling_config.num_classes,
-			hard_sampling_temperature=val_sampling_config.hard_sampling_temperature,
-			hard_sampling_prob=val_sampling_config.hard_sampling_prob,
-			hard_sampling_device=val_sampling_config.hard_sampling_device,
+			cluster_file=val_sampling_config.cluster_file,
+			preloaded_data=val_preloaded,
 		)
 		split_rng_val = np.random.default_rng(val_sampling_config.seed + 13)
 	else:
@@ -262,14 +284,27 @@ def train_projection_head_with_sampler(
 			max_cached_shards=sampling_config.max_cached_shards,
 			sampler_backend=sampling_config.sampler_backend,
 			excluded_classes=set(sampler.available_classes),
-			enable_hard_sampling=sampling_config.enable_hard_sampling,
-			num_classes=sampling_config.num_classes,
-			hard_sampling_temperature=sampling_config.hard_sampling_temperature,
-			hard_sampling_prob=sampling_config.hard_sampling_prob,
-			hard_sampling_device=sampling_config.hard_sampling_device,
+			cluster_file=sampling_config.cluster_file,
+			preloaded_data=train_preloaded,
 		)
 		split_rng_heldout = np.random.default_rng(sampling_config.seed + 19)
 		print(f"[info] Created held-out validation sampler with {len(val_heldout_sampler.available_classes)} held-out classes")
+
+	butterfly_evaluator: ButterflyEvaluator | None = None
+	if butterfly_features_dir is not None:
+		try:
+			butterfly_evaluator = ButterflyEvaluator(
+				features_dir=butterfly_features_dir,
+				projection_dim=projection_dim or 128,
+				seed=sampling_config.seed,
+				n_estimators=butterfly_n_estimators,
+			)
+		except FileNotFoundError as e:
+			print(
+				f"[warn] Butterfly validation disabled — feature files not found: {e}\n"
+				"       Run: python -m imagenet_projection.butterfly_eval --help",
+				flush=True,
+			)
 
 	val_cache: list[dict[str, Any]] = []
 	if val_sampler is not None and val_sampling_config is not None and split_rng_val is not None:
@@ -379,6 +414,9 @@ def train_projection_head_with_sampler(
 		hyper_attn_heads=hyper_attn_heads,
 		hyper_attn_layers=hyper_attn_layers,
 		hyper_attn_use_pos_embed=hyper_attn_use_pos_embed,
+		hyper_svd_scale_by_singular_values=hyper_svd_scale_by_singular_values,
+		hyper_lda_scale_by_eigenvalues=hyper_lda_scale_by_eigenvalues,
+		hyper_lda_regularization=hyper_lda_regularization,
 		use_random_projection_init=use_random_projection_init,
 		device=device_t,
 	)
@@ -469,6 +507,7 @@ def train_projection_head_with_sampler(
 		"total_loss": [],
 		"step_time_ms": [],
 		"timing_eigendecomp_ms": [],
+		"timing_lda_ms": [],
 		"timing_hyper_encoder_ms": [],
 		"timing_hyper_decoder_ms": [],
 		"timing_hyper_forward_ms": [],
@@ -492,7 +531,10 @@ def train_projection_head_with_sampler(
 		"timing_sample_ms": [],
 		"timing_val_sample_ms": [],
 		"timing_heldout_sample_ms": [],
-		"used_hard_sampling": [],
+		"used_cluster_sampling": [],
+		"butterfly_test_accuracy": [],
+		"butterfly_pca_test_accuracy": [],
+		"butterfly_rp_test_accuracy": [],
 	}
 	best_val_acc = float("-inf")
 	best_val_loss = float("inf")
@@ -517,13 +559,6 @@ def train_projection_head_with_sampler(
 			rng_state_payload["split_rng_heldout"] = split_rng_heldout.bit_generator.state
 		if torch.cuda.is_available():
 			rng_state_payload["torch_cuda_all"] = [state.cpu() for state in torch.cuda.get_rng_state_all()]
-		if sampler.hard_sampler is not None:
-			rng_state_payload["sampler_hard_rng"] = sampler.hard_sampler.generator.get_state().cpu()
-		if val_sampler is not None and val_sampler.hard_sampler is not None:
-			rng_state_payload["val_sampler_hard_rng"] = val_sampler.hard_sampler.generator.get_state().cpu()
-		if val_heldout_sampler is not None and val_heldout_sampler.hard_sampler is not None:
-			rng_state_payload["val_heldout_sampler_hard_rng"] = val_heldout_sampler.hard_sampler.generator.get_state().cpu()
-
 		run_metadata: dict[str, Any] = {
 			"effective_train_args": dict(effective_train_args or {}),
 			"wandb_project": str(wandb_project),
@@ -620,19 +655,7 @@ def train_projection_head_with_sampler(
 				except Exception:
 					print("[warn] Failed to restore CUDA RNG state from checkpoint")
 
-			sam_hard_state = rng_state.get("sampler_hard_rng")
-			if sampler.hard_sampler is not None and isinstance(sam_hard_state, torch.Tensor):
-				sampler.hard_sampler.generator.set_state(sam_hard_state.cpu())
-			val_sam_hard_state = rng_state.get("val_sampler_hard_rng")
-			if val_sampler is not None and val_sampler.hard_sampler is not None and isinstance(val_sam_hard_state, torch.Tensor):
-				val_sampler.hard_sampler.generator.set_state(val_sam_hard_state.cpu())
-			ho_sam_hard_state = rng_state.get("val_heldout_sampler_hard_rng")
-			if (
-				val_heldout_sampler is not None
-				and val_heldout_sampler.hard_sampler is not None
-				and isinstance(ho_sam_hard_state, torch.Tensor)
-			):
-				val_heldout_sampler.hard_sampler.generator.set_state(ho_sam_hard_state.cpu())
+
 		if start_step > num_steps:
 			print(
 				f"[info] Resume checkpoint already at step {start_step - 1}; "
@@ -667,6 +690,7 @@ def train_projection_head_with_sampler(
 					features=X_val_step,
 					support_indices=support_idx,
 					zca_epsilon=zca_epsilon,
+					support_labels=y_val_step,
 				)
 				X_support_val = X_proj_val.index_select(0, support_idx)
 				y_support_val = y_val_step.index_select(0, support_idx)
@@ -780,6 +804,7 @@ def train_projection_head_with_sampler(
 					features=X_val_step,
 					support_indices=support_idx,
 					zca_epsilon=zca_epsilon,
+					support_labels=y_val_step,
 				)
 				X_support_val = X_proj_val.index_select(0, support_idx)
 				y_support_val = y_val_step.index_select(0, support_idx)
@@ -913,6 +938,7 @@ def train_projection_head_with_sampler(
 			features=X_step,
 			support_indices=support_idx,
 			zca_epsilon=zca_epsilon,
+			support_labels=y_step,
 			return_projection_matrix=True,
 		)
 		if isinstance(proj_out, tuple):
@@ -924,11 +950,13 @@ def train_projection_head_with_sampler(
 		if enable_attention_spectral_timers:
 			hyper_timing = getattr(head, "last_profile", {})
 			history["timing_eigendecomp_ms"].append(float(hyper_timing.get("eigendecomp_ms", 0.0)))
+			history["timing_lda_ms"].append(float(hyper_timing.get("lda_ms", 0.0)))
 			history["timing_hyper_encoder_ms"].append(float(hyper_timing.get("encoder_ms", 0.0)))
 			history["timing_hyper_decoder_ms"].append(float(hyper_timing.get("decoder_ms", 0.0)))
 			history["timing_hyper_forward_ms"].append(float(hyper_timing.get("hypernetwork_forward_ms", 0.0)))
 		else:
 			history["timing_eigendecomp_ms"].append(0.0)
+			history["timing_lda_ms"].append(0.0)
 			history["timing_hyper_encoder_ms"].append(0.0)
 			history["timing_hyper_decoder_ms"].append(0.0)
 			history["timing_hyper_forward_ms"].append(0.0)
@@ -971,15 +999,18 @@ def train_projection_head_with_sampler(
 					"train/total_loss": float(total_loss.detach().cpu().item()),
 					"metrics/grad_norm": grad_norm,
 					"metrics/W_norm": w_norm,
+					"metrics/support_size": int(X_support.shape[0]),
+					"metrics/query_size": int(y_query.shape[0]),
 					"metrics/query_fraction": float(y_query.shape[0] / max(1, X_step.shape[0])),
 					"metrics/learning_rate": current_lr,
 					"metrics/optimizer_step": optimizer_step_count,
 					"timing/sample_ms": sample_time_ms,
-					"timing/used_hard_sampling": float(meta.get("used_hard_sampling", False)),
+					"timing/used_cluster_sampling": float(meta.get("used_cluster_sampling", False)),
 					"step": step,
 				}
 				if enable_attention_spectral_timers:
 					log_payload["timing/eigendecomp_ms"] = history["timing_eigendecomp_ms"][-1]
+					log_payload["timing/lda_ms"] = history["timing_lda_ms"][-1]
 					log_payload["timing/hyper_encoder_ms"] = history["timing_hyper_encoder_ms"][-1]
 					log_payload["timing/hyper_decoder_ms"] = history["timing_hyper_decoder_ms"][-1]
 					log_payload["timing/hyper_forward_ms"] = history["timing_hyper_forward_ms"][-1]
@@ -1008,7 +1039,7 @@ def train_projection_head_with_sampler(
 		history["n_classes"].append(float(meta["n_classes"]))
 		history["step_time_ms"].append(float((time.perf_counter() - step_t0) * 1000.0))
 		history["timing_sample_ms"].append(float(sample_time_ms))
-		history["used_hard_sampling"].append(float(meta.get("used_hard_sampling", False)))
+		history["used_cluster_sampling"].append(float(meta.get("used_cluster_sampling", False)))
 
 		if step == 1 or step % log_every == 0 or step == num_steps:
 			n_pending = accum_counter
@@ -1016,6 +1047,7 @@ def train_projection_head_with_sampler(
 			if enable_attention_spectral_timers:
 				timing_suffix = (
 					f" eig_ms={history['timing_eigendecomp_ms'][-1]:.2f}"
+					f" lda_ms={history['timing_lda_ms'][-1]:.2f}"
 					f" hyper_enc_ms={history['timing_hyper_encoder_ms'][-1]:.2f}"
 					f" hyper_dec_ms={history['timing_hyper_decoder_ms'][-1]:.2f}"
 					f" tabicl_ms={history['timing_tabicl_forward_ms'][-1]:.2f}"
@@ -1025,7 +1057,7 @@ def train_projection_head_with_sampler(
 				f"loss={history['loss'][-1]:.4f} "
 				f"dataset={int(meta['dataset_size'])} "
 				f"classes={int(meta['n_classes'])} "
-				f"query={int(y_query.shape[0])}/{int(X_step.shape[0])} ({query_frac:.3f}) "
+				f"support={int(X_support.shape[0])} query={int(y_query.shape[0])} ({query_frac:.3f}) "
 				f"accum_pending={n_pending}/{accum_target}"
 				f"{timing_suffix}"
 			)
@@ -1105,6 +1137,32 @@ def train_projection_head_with_sampler(
 					f"[info] Saved new best held-out checkpoint "
 					f"(acc={best_heldout_acc:.4f}, loss={best_heldout_loss:.4f}) "
 					f"to {best_heldout_checkpoint_path}"
+				)
+
+		if butterfly_evaluator is not None and (step % val_every == 0 or step == num_steps):
+			butterfly_metrics = butterfly_evaluator.evaluate(
+				head=head,
+				projection_method=projection_method,
+				device=device_t,
+			)
+			bf_test_acc     = float(butterfly_metrics["test_acc"])
+			bf_pca_test_acc = float(butterfly_evaluator.pca_test_acc)
+			bf_rp_test_acc  = float(butterfly_evaluator.rp_test_acc)
+			history["butterfly_test_accuracy"].append(bf_test_acc)
+			history["butterfly_pca_test_accuracy"].append(bf_pca_test_acc)
+			history["butterfly_rp_test_accuracy"].append(bf_rp_test_acc)
+			print(
+				f"[butterfly step {step:04d}/{num_steps}] "
+				f"test_acc={bf_test_acc:.4f}  pca={bf_pca_test_acc:.4f}  rp={bf_rp_test_acc:.4f}"
+			)
+			if enable_wandb and wandb is not None:
+				wandb.log(
+					{
+						"butterfly/test_accuracy":     bf_test_acc,
+						"butterfly/pca_test_accuracy": bf_pca_test_acc,
+						"butterfly/rp_test_accuracy":  bf_rp_test_acc,
+						"step": step,
+					}
 				)
 
 	if best_state is not None:
