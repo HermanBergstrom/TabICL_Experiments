@@ -11,14 +11,16 @@ LEGEND_FONT_SIZE = 13
 
 INJECTION_PREFIXES = {
     "noise": "noise_",
-    "low_rank": "low_rank_concat_",
-    "low_signal": "low_signal_",
+    "low_rank": "low_rank_proj_",
+    "low_signal": "low_signal_proj_",
+    "sparse_low_rank": "sparse_low_rank_proj_",
 }
 
 INJECTION_TITLES = {
     "noise": "Pure Noise Features",
-    "low_rank": "Low-Rank Features",
-    "low_signal": "Low-Signal Features",
+    "low_rank": "Low-Rank Projection Features",
+    "low_signal": "Low-Signal Projection Features",
+    "sparse_low_rank": "Sparse Low-Rank Projection Features",
 }
 
 REDUCTION_METHODS = {
@@ -329,13 +331,19 @@ def _dataset_subtitle(metadata):
     if metadata.get("normalized_effective_rank") is not None:
         parts.append(f"norm. eff. rank = {metadata['normalized_effective_rank']:.3f}")
     return "  |  ".join(parts)
-def make_per_method_plots(data, output_dir, n_informative_features, metadata=None):
-    """Create one 3-panel figure for each reduction method."""
-    injection_types = ["noise", "low_rank", "low_signal"]
+def make_per_method_plots(data, output_dir, n_informative_features, metadata=None, injection_filter=None):
+    """Create one figure for each reduction method."""
+    injection_types = (
+        [injection_filter] if injection_filter
+        else ["noise", "low_rank", "low_signal", "sparse_low_rank"]
+    )
     subtitle        = _dataset_subtitle(metadata)
 
     for method in ["no_reduction", "pca", "rp"]:
-        fig, axes = plt.subplots(1, 3, figsize=(20, 5), sharey=True)
+        n_panels = len(injection_types)
+        fig, axes = plt.subplots(1, n_panels, figsize=(6.5 * n_panels, 5), sharey=True)
+        if n_panels == 1:
+            axes = [axes]
 
         for ax, injection_type in zip(axes, injection_types):
             plot_injection_type(
@@ -371,17 +379,23 @@ def make_per_method_plots(data, output_dir, n_informative_features, metadata=Non
         plt.close(fig)
 
 
-def make_joint_comparison_plot(data, output_dir, n_informative_features, metadata=None):
-    """Create a 3×3 joint plot: rows = injection types, cols = reduction methods."""
-    injection_types = ["noise", "low_rank", "low_signal"]
-    methods         = ["no_reduction", "pca", "rp"]
-    subtitle        = _dataset_subtitle(metadata)
+def make_joint_comparison_plot(data, output_dir, n_informative_features, metadata=None, injection_filter=None):
+    """Create a joint plot: rows = injection types, cols = reduction methods."""
+    injection_types = (
+        [injection_filter] if injection_filter
+        else ["noise", "low_rank", "low_signal", "sparse_low_rank"]
+    )
+    methods  = ["no_reduction", "pca", "rp"]
+    n_rows   = len(injection_types)
+    subtitle = _dataset_subtitle(metadata)
 
-    fig, axes = plt.subplots(3, 3, figsize=(20, 15), sharey="row")
+    fig, axes = plt.subplots(n_rows, 3, figsize=(20, 5 * n_rows), sharey="row")
+    if n_rows == 1:
+        axes = [axes]
 
     for row_idx, injection_type in enumerate(injection_types):
         for col_idx, method in enumerate(methods):
-            ax = axes[row_idx, col_idx]
+            ax = axes[row_idx][col_idx]
             plot_injection_type(
                 ax,
                 injection_type,
@@ -395,7 +409,7 @@ def make_joint_comparison_plot(data, output_dir, n_informative_features, metadat
             if col_idx != 0:
                 ax.set_ylabel("")
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(
         handles, labels,
         loc="upper center",
@@ -417,7 +431,7 @@ def make_joint_comparison_plot(data, output_dir, n_informative_features, metadat
     # Row headings (injection type labels on the left)
     fig.canvas.draw()
     for row_idx, injection_type in enumerate(injection_types):
-        row_ax = axes[row_idx, 0]
+        row_ax = axes[row_idx][0]
         bbox   = row_ax.get_position()
         y_center = (bbox.y0 + bbox.y1) / 2.0
         fig.text(
@@ -477,9 +491,11 @@ def run_synthetic_mode(args):
     data = load_all_results(args.normal_input, args.pca_input, args.rp_input)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    make_per_method_plots(data, args.output_dir, args.n_informative_features)
+    make_per_method_plots(data, args.output_dir, args.n_informative_features,
+                          injection_filter=args.injection_type)
     joint_path = make_joint_comparison_plot(
-        data, args.output_dir, args.n_informative_features
+        data, args.output_dir, args.n_informative_features,
+        injection_filter=args.injection_type,
     )
 
     print(f"\nSaved plots to: {args.output_dir}")
@@ -518,9 +534,11 @@ def run_task_mode(args):
         out_dir = args.output_dir / safe_label
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        make_per_method_plots(data, out_dir, n_ref, metadata=metadata)
+        make_per_method_plots(data, out_dir, n_ref, metadata=metadata,
+                              injection_filter=args.injection_type)
         joint_path = make_joint_comparison_plot(
-            data, out_dir, n_ref, metadata=metadata
+            data, out_dir, n_ref, metadata=metadata,
+            injection_filter=args.injection_type,
         )
         print(f"    -> {joint_path}\n")
 
@@ -581,6 +599,16 @@ def main():
         type=Path,
         default=Path("plots/feature_quality_comparison"),
         help="Root directory where plot images will be written.",
+    )
+    parser.add_argument(
+        "--injection-type",
+        choices=list(INJECTION_PREFIXES.keys()),
+        default=None,
+        help=(
+            "If set, only plot this injection type. "
+            "Choices: " + ", ".join(INJECTION_PREFIXES.keys()) + ". "
+            "Default: plot all."
+        ),
     )
     parser.add_argument(
         "--n-informative-features",

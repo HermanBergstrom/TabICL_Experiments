@@ -19,6 +19,7 @@ multimodal-embeddings-489820-03efef353fa6.json
 wandb/
 catboost_info/
 .claude/
+patch_quality_results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
