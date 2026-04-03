@@ -360,6 +360,59 @@ def group_patches(patches: np.ndarray, patch_group_size: int) -> np.ndarray:
     return grouped.astype(patches.dtype)
 
 
+def _pool_features_with_clf(
+    grouped_patches:     np.ndarray,     # [N, P', D]
+    labels:              np.ndarray,     # [N]   true label per image (for weight computation)
+    support_labels:      np.ndarray,     # [N_support]  (for attention-based scoring)
+    clf:                 TabICLClassifier,
+    scoring_pca:         Optional[PCA],  # PCA that was fitted on the support
+    n_classes:           int,
+    n_support:           int,
+    temperature:         float,
+    weight_method:       str,
+    gamma:               float,
+    batch_size:          int,
+    distribution_source: str,
+    desc:                str = "Pooling",
+) -> tuple[np.ndarray, np.ndarray]:     # (repooled_raw [N, D], weights [N, P'])
+    """Pool grouped patches using quality weights from a pre-fitted TabICL classifier.
+
+    Scoring is performed in the PCA-projected space that matches the support, while
+    the weighted pooling is applied to the raw (pre-PCA) grouped patch features so
+    that distances in the output space are not distorted by a PCA fitted on a
+    different set of vectors.
+    """
+    N, P, D = grouped_patches.shape
+    repooled_raw = np.zeros((N, D), dtype=np.float32)
+    weights_all  = np.zeros((N, P), dtype=np.float32)
+
+    for batch_start in tqdm(range(0, N, batch_size), desc=desc, unit="batch", leave=False):
+        batch_end = min(batch_start + batch_size, N)
+        batch     = grouped_patches[batch_start:batch_end]   # [B, P', D]
+        B         = batch_end - batch_start
+
+        query_raw:  np.ndarray = batch.reshape(B * P, D)
+        query_feat: np.ndarray = (
+            scoring_pca.transform(query_raw) if scoring_pca is not None else query_raw
+        )
+
+        probs = _get_patch_distributions(
+            clf, query_feat, support_labels, n_classes, n_support, distribution_source
+        )                                              # [B*P', n_classes]
+        probs = probs.reshape(B, P, -1)                # [B, P', n_classes]
+
+        for j in range(B):
+            idx        = batch_start + j
+            true_label = int(labels[idx])
+            weights    = compute_patch_pooling_weights(
+                probs[j], true_label, temperature, weight_method, gamma
+            )
+            weights_all[idx]  = weights
+            repooled_raw[idx] = (weights[:, None] * batch[j]).sum(axis=0)
+
+    return repooled_raw, weights_all
+
+
 def refine_dataset_features(
     train_patches:    np.ndarray,      # [N, P, D]  raw DINO patch features
     train_labels:     np.ndarray,      # [N]
@@ -376,7 +429,7 @@ def refine_dataset_features(
     fit_ridge:           bool  = False,
     ridge_alpha:         float = 1.0,
     normalize_features:  bool  = False,
-) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Optional[Ridge], Optional[StandardScaler]]:
+) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Optional[Ridge], Optional[StandardScaler], TabICLClassifier]:
     """Replace mean-pooled support features with quality-weighted patch pooling,
     and optionally fit a Ridge regressor on the patch quality logits — all in a
     single TabICL forward pass over the training set.
@@ -402,6 +455,7 @@ def refine_dataset_features(
     weights_all : np.ndarray, shape [N, P]
     ridge_model : Ridge or None
     feature_scaler : StandardScaler or None
+    clf : TabICLClassifier  (the classifier fitted on the *input* support_features)
     """
     N, P, D = train_patches.shape
     repooled_raw = np.zeros((N, D), dtype=np.float32)
@@ -504,7 +558,7 @@ def refine_dataset_features(
         else:
             mixed = mixed_raw
 
-    return mixed, new_pca, weights_all, ridge_model, feature_scaler
+    return mixed, new_pca, weights_all, ridge_model, feature_scaler, clf
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +757,20 @@ def _compute_accuracy(
     return float((preds == test_labels).mean())
 
 
+def _compute_accuracy_from_features(
+    support_features: np.ndarray,   # [N_train, d]
+    support_labels:   np.ndarray,   # [N_train]
+    query_features:   np.ndarray,   # [N_test, d]  already projected into support space
+    query_labels:     np.ndarray,   # [N_test]
+    n_estimators:     int = 1,
+    seed:             int = 42,
+) -> float:
+    """Classify pre-projected query features against a support set."""
+    clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
+    clf.fit(support_features, support_labels)
+    return float((clf.predict(query_features) == query_labels).mean())
+
+
 def _run_visual_eval(
     tag:              str,
     support_features: np.ndarray,      # [N_train, d]
@@ -820,33 +888,33 @@ def _run_visual_eval(
 # ---------------------------------------------------------------------------
 
 def run_patch_quality_eval(
-    features_dir:  Path = FEATURES_DIR,
-    dataset_path:  Path = DATASET_PATH,
-    n_sample:      int  = 8,
-    n_train:       Optional[int] = None,
-    n_estimators:  int  = 1,
-    pca_dim:       Optional[int] = 128,
-    seed:          int  = 42,
-    output_dir:    Path = Path("patch_quality_results"),
-    patch_size:    int  = 16,
-    patch_group_size: int = 1,
-    refine:        bool  = False,
-    temperature:   float = 1.0,
-    batch_size:    int   = 10,
-    weight_method: str   = "logit",
-    gamma:         float = 1.0,
-    mix_lambda:          float = 1.0,
-    distribution_source: str  = "softmax",
-    visualize_attention: bool = False,
-    fit_ridge:          bool  = False,
-    ridge_alpha:        float = 1.0,
-    normalize_features: bool  = False,
+    features_dir:      Path          = FEATURES_DIR,
+    dataset_path:      Path          = DATASET_PATH,
+    n_sample:          int           = 8,
+    n_train:           Optional[int] = None,
+    n_estimators:      int           = 1,
+    pca_dim:           Optional[int] = 128,
+    seed:              int           = 42,
+    output_dir:        Path          = Path("patch_quality_results"),
+    patch_size:        int           = 16,
+    patch_group_sizes: list          = [1],
+    refine:            bool          = False,
+    temperature:       float         = 1.0,
+    batch_size:        int           = 10,
+    weight_method:     str           = "logit",
+    gamma:             float         = 1.0,
+    mix_lambda:        float         = 1.0,
+    distribution_source: str        = "softmax",
+    visualize_attention: bool       = False,
+    fit_ridge:         bool          = False,
+    ridge_alpha:       float         = 1.0,
+    normalize_features: bool        = False,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Load pre-extracted training features (always the support set) ---
-    train_ds = ButterflyPatchDataset(features_dir, split="train")
+    # --- Load pre-extracted patch features (always at original resolution) ---
+    train_ds      = ButterflyPatchDataset(features_dir, split="train")
     train_patches = train_ds.features.numpy()   # [N, P, D]
     train_labels  = train_ds.labels.numpy()     # [N]
 
@@ -858,140 +926,191 @@ def run_patch_quality_eval(
         train_labels  = train_labels[sub_idx]
         print(f"[info] Training set subsampled: {n_train} / {train_ds.features.shape[0]} images")
 
-    # --- Load test features ---
-    test_ds = ButterflyPatchDataset(features_dir, split="test")
+    test_ds      = ButterflyPatchDataset(features_dir, split="test")
     test_patches = test_ds.features.numpy()   # [N_test, P, D]
     test_labels  = test_ds.labels.numpy()     # [N_test]
 
-    # --- Group patches in DINO space (before any PCA) ---
-    if patch_group_size > 1:
-        group_side = int(round(patch_group_size ** 0.5))
-        P_orig        = train_patches.shape[1]
-        train_patches = group_patches(train_patches, patch_group_size)
-        test_patches  = group_patches(test_patches,  patch_group_size)
-        print(f"[info] Patch grouping {group_side}×{group_side}: "
-              f"P {P_orig} → {train_patches.shape[1]} patches per image")
-
     N_train, _P, D = train_patches.shape
-    effective_patch_size = patch_size * int(round(patch_group_size ** 0.5))
+    n_classes      = int(train_labels.max()) + 1
+    n_stages       = len(patch_group_sizes)
 
-    # --- Support set: mean-pool → [N_train, D] ---
-    baseline_support = train_patches.mean(axis=1)   # [N_train, D]
+    # Normalise temperature / ridge_alpha → one value per stage.
+    # Scalar or single-element list → broadcast to all stages.
+    # Multi-element list → must match n_stages exactly.
+    def _broadcast(val, label: str) -> list:
+        if isinstance(val, (int, float)):
+            return [float(val)] * n_stages
+        vals = list(val)
+        if len(vals) == 1:
+            return vals * n_stages
+        if len(vals) != n_stages:
+            raise ValueError(
+                f"{label}: {len(vals)} value(s) given for {n_stages} stage(s) in "
+                f"--patch-group-sizes; pass a single value (broadcast to all stages) "
+                f"or exactly {n_stages} value(s)."
+            )
+        return vals
 
-    # --- Optional PCA fitted on support set (applied to all queries) ---
+    temperatures = _broadcast(temperature,  "--temperature")
+    ridge_alphas = _broadcast(ridge_alpha,  "--ridge-alpha")
+
+    # --- Baseline support: mean-pool original patches → optional PCA ---
+    baseline_support_raw = train_patches.mean(axis=1)   # [N_train, D]
     pca: Optional[PCA] = None
     if pca_dim is not None:
         n_comp = min(pca_dim, N_train, D)
-        pca = PCA(n_components=n_comp, random_state=seed)
-        baseline_support = pca.fit_transform(baseline_support)   # [N_train, n_comp]
+        pca    = PCA(n_components=n_comp, random_state=seed)
+        baseline_support = pca.fit_transform(baseline_support_raw).astype(np.float32)
         print(f"[info] PCA: {D}D → {n_comp}D")
+    else:
+        baseline_support = baseline_support_raw
 
-    # --- Single quality-scoring pass: optionally refine support and/or fit Ridge ---
-    ridge_model:     Optional[Ridge]          = None
-    feature_scaler:  Optional[StandardScaler] = None
-    refined_support: Optional[np.ndarray]     = None
-    refined_pca:     Optional[PCA]            = None
-    if fit_ridge or refine:
-        print(f"\n[info] Computing patch quality scores "
-              f"(method={weight_method}, source={distribution_source}, "
-              f"temperature={temperature}, gamma={gamma}"
-              + (f", mix_lambda={mix_lambda}" if refine else "")
-              + (f", ridge_alpha={ridge_alpha}" if fit_ridge else "") + ") ...")
-        refined_support, refined_pca, _, ridge_model, feature_scaler = refine_dataset_features(
-            train_patches, train_labels, baseline_support,
-            pca=pca, n_estimators=n_estimators,
-            temperature=temperature, seed=seed, batch_size=batch_size,
-            weight_method=weight_method, gamma=gamma, mix_lambda=mix_lambda,
-            distribution_source=distribution_source,
-            fit_ridge=fit_ridge, ridge_alpha=ridge_alpha,
-            normalize_features=normalize_features,
-        )
-        if fit_ridge:
-            ridge_path = output_dir / "ridge_quality_model.joblib"
-            joblib.dump(ridge_model, ridge_path)
-            print(f"[ridge] Model saved → {ridge_path}")
-
-    # --- Reconstruct image paths for both splits ---
+    # --- Reconstruct image paths and draw fixed visualisation sample indices ---
     train_image_paths, _, idx_to_class = _get_image_paths(dataset_path, split="train", seed=seed)
     test_image_paths,  _, _            = _get_image_paths(dataset_path, split="test",  seed=seed)
 
-    rng = np.random.RandomState(seed)
+    rng              = np.random.RandomState(seed)
     train_sample_idx = rng.choice(len(train_labels), size=min(n_sample, len(train_labels)), replace=False)
     test_sample_idx  = rng.choice(len(test_labels),  size=min(n_sample, len(test_labels)),  replace=False)
 
-    split_configs = [
-        ("train", train_patches, train_labels, train_image_paths, train_sample_idx),
-        ("test",  test_patches,  test_labels,  test_image_paths,  test_sample_idx),
-    ]
-
-    common_kwargs = dict(
-        train_labels=train_labels,
-        split_configs=split_configs,
-        idx_to_class=idx_to_class,
-        pca=pca,
-        n_estimators=n_estimators,
-        patch_size=effective_patch_size,
-        seed=seed,
-        output_dir=output_dir,
-        temperature=temperature,
-        gamma=gamma,
-        weight_method=weight_method,
-        visualize_attention=visualize_attention,
-        ridge_model=ridge_model,
-        feature_scaler=feature_scaler,
-    )
-
-    # --- Baseline accuracy + visual eval ---
+    # --- Baseline: accuracy + visual eval at original patch resolution ---
     baseline_acc = _compute_accuracy(
         baseline_support, train_labels, test_patches, test_labels,
         pca=pca, n_estimators=n_estimators, seed=seed,
     )
     print(f"\n[baseline] test accuracy: {baseline_acc:.4f}")
-    baseline_mean_probs = _run_visual_eval("baseline", baseline_support, **common_kwargs)
+
+    split_configs_orig = [
+        ("train", train_patches, train_labels, train_image_paths, train_sample_idx),
+        ("test",  test_patches,  test_labels,  test_image_paths,  test_sample_idx),
+    ]
+    baseline_mean_probs = _run_visual_eval(
+        "baseline", baseline_support, train_labels, split_configs_orig, idx_to_class,
+        pca=pca, n_estimators=n_estimators, patch_size=patch_size,
+        seed=seed, output_dir=output_dir,
+        temperature=temperatures[0], gamma=gamma, weight_method=weight_method,
+        visualize_attention=visualize_attention, ridge_model=None, feature_scaler=None,
+    )
 
     if not refine:
         return
 
-    # --- Refined accuracy + visual eval (support already computed above) ---
-    print(f"[info] Refinement complete. Support shape: {refined_support.shape}")
+    # ---------------------------------------------------------------------------
+    # Iterative multi-scale refinement
+    # ---------------------------------------------------------------------------
+    # Each stage groups the original DINO patches at a given resolution, visualises
+    # patch quality scores under the *current* (pre-refinement) support, refines the
+    # support via quality-weighted pooling, then evaluates accuracy using the same
+    # clf and pooling that drove the refinement (ensuring query pooling matches
+    # how training embeddings were constructed).
+    # ---------------------------------------------------------------------------
 
-    # Always evaluate with mean-pooled queries so the query representation is
-    # held constant and only the support changes.
-    refined_acc_mean = _compute_accuracy(
-        refined_support, train_labels, test_patches, test_labels,
-        pca=refined_pca, n_estimators=n_estimators, seed=seed,
-        ridge_model=None,
-    )
-    print(f"\n[refined]  test accuracy (mean-pooled queries):  {refined_acc_mean:.4f}")
+    current_support = baseline_support
+    current_pca     = pca
+    all_results: list[tuple[str, float, dict]] = [
+        ("baseline", baseline_acc, baseline_mean_probs)
+    ]
 
-    # When a Ridge model is available, also evaluate with Ridge-repooled queries.
-    refined_acc_ridge: Optional[float] = None
-    if ridge_model is not None:
-        refined_acc_ridge = _compute_accuracy(
-            refined_support, train_labels, test_patches, test_labels,
-            pca=refined_pca, n_estimators=n_estimators, seed=seed,
-            ridge_model=ridge_model, feature_scaler=feature_scaler,
+    for stage_idx, group_size in enumerate(patch_group_sizes):
+        stage_temp  = temperatures[stage_idx]
+        stage_alpha = ridge_alphas[stage_idx]
+        group_side   = int(round(group_size ** 0.5))
+        eff_patch_sz = patch_size * group_side
+        tag          = f"iter_{stage_idx}_g{group_size}"
+
+        print(f"\n[{tag}] group_size={group_size}  ({group_side}×{group_side} patches per group)  "
+              f"T={stage_temp}" + (f"  ridge_alpha={stage_alpha}" if fit_ridge else ""))
+
+        train_grouped = group_patches(train_patches, group_size)   # [N, P', D]
+        test_grouped  = group_patches(test_patches,  group_size)   # [N_test, P', D]
+        P_grouped     = train_grouped.shape[1]
+
+        # -- Visualise patch quality under the *input* support (before refinement) --
+        # This matches exactly what will drive the pooling weights this stage.
+        split_configs_iter = [
+            ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
+            ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
+        ]
+        iter_mean_probs = _run_visual_eval(
+            tag, current_support, train_labels, split_configs_iter, idx_to_class,
+            pca=current_pca, n_estimators=n_estimators, patch_size=eff_patch_sz,
+            seed=seed, output_dir=output_dir,
+            temperature=stage_temp, gamma=gamma, weight_method=weight_method,
+            visualize_attention=visualize_attention, ridge_model=None, feature_scaler=None,
         )
-        print(f"[refined]  test accuracy (ridge-pooled queries): {refined_acc_ridge:.4f}")
 
-    refined_common_kwargs = {**common_kwargs, "pca": refined_pca}
-    refined_mean_probs = _run_visual_eval("refined", refined_support, **refined_common_kwargs)
+        # -- Refine support (clf fitted on current_support internally) --
+        print(f"[{tag}] Refining support "
+              f"(method={weight_method}, source={distribution_source}, T={stage_temp}) ...")
+        new_support, new_pca, _weights, ridge_model, feature_scaler, scoring_clf = \
+            refine_dataset_features(
+                train_grouped, train_labels, current_support, current_pca,
+                n_estimators=n_estimators, temperature=stage_temp, seed=seed,
+                batch_size=batch_size, weight_method=weight_method, gamma=gamma,
+                mix_lambda=mix_lambda, distribution_source=distribution_source,
+                fit_ridge=fit_ridge, ridge_alpha=stage_alpha,
+                normalize_features=normalize_features,
+            )
 
-    # --- Side-by-side comparison ---
-    print("\n" + "=" * 60)
-    print("COMPARISON SUMMARY")
-    print("=" * 60)
-    print(f"  Test accuracy  baseline={baseline_acc:.4f}"
-          f"  refined/mean-q={refined_acc_mean:.4f}  Δ={refined_acc_mean - baseline_acc:+.4f}")
-    if refined_acc_ridge is not None:
-        print(f"  Test accuracy  baseline={baseline_acc:.4f}"
-              f"  refined/ridge-q={refined_acc_ridge:.4f}  Δ={refined_acc_ridge - baseline_acc:+.4f}")
-    for split_name in baseline_mean_probs:
-        b = baseline_mean_probs[split_name]
-        r = refined_mean_probs.get(split_name, float("nan"))
-        print(f"  Mean P(true) [{split_name:5s}]  baseline={b:.3f}  refined={r:.3f}"
-              f"  Δ={r - b:+.3f}")
-    print("=" * 60)
+        if fit_ridge and ridge_model is not None:
+            ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
+            joblib.dump(ridge_model, ridge_path)
+            print(f"[ridge] Model saved → {ridge_path}")
+
+        # -- Pool test queries using the *same* clf and pooling as the training pass --
+        # Ridge takes precedence when available (matches how training was repooled).
+        if ridge_model is not None:
+            flat = test_grouped.reshape(len(test_labels) * P_grouped, D)
+            if feature_scaler is not None:
+                flat = feature_scaler.transform(flat)
+            logits = ridge_model.predict(flat).reshape(
+                len(test_labels), P_grouped
+            ).astype(np.float32)
+            logits -= logits.max(axis=1, keepdims=True)
+            exp_l   = np.exp(logits)
+            w_ridge = exp_l / exp_l.sum(axis=1, keepdims=True)
+            test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)   # [N_test, D]
+        else:
+            test_repooled, _ = _pool_features_with_clf(
+                test_grouped, test_labels, train_labels,
+                scoring_clf, current_pca,
+                n_classes, N_train,
+                stage_temp, weight_method, gamma, batch_size, distribution_source,
+                desc=f"[{tag}] Pooling test queries",
+            )
+
+        test_query = (
+            new_pca.transform(test_repooled).astype(np.float32)
+            if new_pca is not None else test_repooled
+        )
+
+        # -- Evaluate accuracy with quality-pooled test queries --
+        iter_acc = _compute_accuracy_from_features(
+            new_support, train_labels, test_query, test_labels,
+            n_estimators=n_estimators, seed=seed,
+        )
+        print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}")
+
+        all_results.append((tag, iter_acc, iter_mean_probs))
+        current_support = new_support
+        current_pca     = new_pca
+
+    # --- Summary table ---
+    col_w = max(len(r[0]) for r in all_results) + 2
+    print("\n" + "=" * (col_w + 42))
+    print("ITERATIVE REFINEMENT SUMMARY")
+    print("=" * (col_w + 42))
+    print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'Δ Acc':>8}  "
+          f"{'P(true)/train':>14}  {'P(true)/test':>13}")
+    print("-" * (col_w + 42))
+    for stage_name, acc, mean_probs in all_results:
+        delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
+        print(
+            f"  {stage_name:<{col_w}}  {acc:>10.4f}  {delta_str:>8}"
+            f"  {mean_probs.get('train', float('nan')):>14.3f}"
+            f"  {mean_probs.get('test', float('nan')):>13.3f}"
+        )
+    print("=" * (col_w + 42))
 
 
 # ---------------------------------------------------------------------------
@@ -1011,16 +1130,21 @@ def _parse_args() -> argparse.Namespace:
                    help="Disable PCA (use full 768-D embeddings)")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--output-dir",    type=Path,  default=Path("patch_quality_results"))
-    p.add_argument("--patch-size",       type=int,   default=16)
-    p.add_argument("--patch-group-size", type=int,   default=1,
-                   help="Number of neighbouring patches to mean-pool into one group "
-                        "before passing to TabICL (must be a perfect square: 1, 4, 9, 16, …). "
-                        "1 = no grouping (default).")
+    p.add_argument("--patch-size",        type=int,   default=16)
+    p.add_argument("--patch-group-sizes", type=int,   nargs="+",  default=[1],
+                   help="Ordered list of patch group sizes for iterative refinement "
+                        "(must each be a perfect square: 1, 4, 9, 16, …). "
+                        "A single value runs one refinement stage at that group size. "
+                        "Multiple values (e.g. --patch-group-sizes 16 4 1) chain stages "
+                        "from coarse to fine, each reusing the previous stage's support. "
+                        "1 = no grouping (individual patches).")
     p.add_argument("--refine",        action="store_true",
                    help="Refine support features with patch-quality weighting before eval")
-    p.add_argument("--temperature",    type=float, default=1.0,
-                   help="Softmax temperature for patch pooling weights "
-                        "(logit method only; large → uniform/mean pooling, small → peaked on best patch)")
+    p.add_argument("--temperature",    type=float, nargs="+",  default=[1.0],
+                   help="Softmax temperature for patch pooling weights. "
+                        "Pass one value to use it for all stages, or one value per entry in "
+                        "--patch-group-sizes to set a different temperature per stage. "
+                        "Large → uniform/mean pooling; small → peaked on best patch.")
     p.add_argument("--batch-size",     type=int,   default=100,
                    help="Number of images per TabICL call during refinement")
     p.add_argument("--weight-method",  type=str,   default="logit",
@@ -1048,8 +1172,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fit-ridge",    action="store_true",
                    help="Fit a Ridge regression model to predict patch quality logits from raw DINO "
                         "features; model is saved to <output-dir>/ridge_quality_model.joblib")
-    p.add_argument("--ridge-alpha",  type=float, default=1.0,
-                   help="Regularisation strength for the Ridge quality model (default 1.0)")
+    p.add_argument("--ridge-alpha",  type=float, nargs="+",  default=[1.0],
+                   help="Regularisation strength for the Ridge quality model. "
+                        "Pass one value to use it for all stages, or one value per entry in "
+                        "--patch-group-sizes to set a different alpha per stage.")
     p.add_argument("--normalize-features", action="store_true",
                    help="Fit a StandardScaler on training patches before Ridge fitting "
                         "(normalises each feature dimension across all N×P patches; "
@@ -1069,7 +1195,7 @@ if __name__ == "__main__":
         seed=args.seed,
         output_dir=args.output_dir,
         patch_size=args.patch_size,
-        patch_group_size=args.patch_group_size,
+        patch_group_sizes=args.patch_group_sizes,
         refine=args.refine,
         temperature=args.temperature,
         batch_size=args.batch_size,
