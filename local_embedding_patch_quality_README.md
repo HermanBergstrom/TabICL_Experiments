@@ -1,7 +1,17 @@
-# local_embedding_patch_quality.py
+# Adaptive Patch Pooling
 
 Evaluates whether individual DINOv2 patch embeddings are discriminative, and optionally
 refines the support set through iterative multi-scale quality-weighted pooling.
+
+## File structure
+
+```
+local_embedding_patch_quality.py   ← entry point (CLI + experiment runner)
+adaptive_patch_pooling/
+    __init__.py                    ← package; re-exports public API
+    patch_pooling.py               ← core algorithms (entropy, weights, refinement)
+    patch_visualisation.py         ← matplotlib figure generation
+```
 
 ---
 
@@ -132,8 +142,7 @@ interpretable as the quality signal that drove each stage's refinement.
 
 Input: `dist [P, n_classes]`, `true_label`, `temperature`, `weight_method`, `gamma`.
 
-The distribution `dist` can come from either `predict_proba` (softmax) or from
-avg-heads attention scores — both are `[P, n_classes]` with rows summing to 1.
+The distribution `dist` comes from `predict_proba` (TabICL softmax) — `[P, n_classes]` with rows summing to 1.
 
 ```
 # logit method (default)
@@ -174,21 +183,16 @@ entropy_logit weights via arithmetic averaging.
 
 ## Visualisation
 
-Each image produces a figure with **1 row** by default, expanding to **2 rows** when
-`--visualize-attention` is set. Each row corresponds to one distribution source and
-contains 6 panels:
+Each image produces a figure with 6 panels:
 
 | Panel | Content |
 |-------|---------|
-| 1 | Original image (labelled with distribution source) |
+| 1 | Original image |
 | 2 | P(true class) per patch — RdYlGn heatmap overlaid on image |
 | 3 | Logit-based pooling weights |
 | 4 | Prediction entropy per patch (normalised by `log(n_classes)`) — RdYlGn_r heatmap |
 | 5 | Entropy-based pooling weights (`entropy` or `entropy_logit` depending on `--weight-method`) |
 | 6 | Combined pooling weights (arithmetic mean of logit and entropy_logit) |
-
-When `--visualize-attention` is set, Row 1 uses the softmax distribution and Row 2 uses
-the avg-heads attention class distribution, enabling direct visual comparison.
 
 At each refinement stage the figures show patches grouped at that stage's `group_size`,
 with the classifier fitted on the **input** support (before refinement), so the heatmaps
@@ -244,8 +248,6 @@ python local_embedding_patch_quality.py [OPTIONS]
 | `--weight-method` | `logit` | How to derive pooling weights: `logit`, `prob`, `entropy`, `entropy_logit`, or `combined` |
 | `--gamma` | `1.0` | Power exponent for the `prob` and `entropy` weight methods |
 | `--mix-lambda` | `1.0` | Interpolation between refined and mean-pooled embeddings (1.0 → fully refined; requires `--refine`) |
-| `--distribution-source` | `softmax` | Distribution used to derive pooling weights: `softmax` (TabICL `predict_proba`) or `attention` (avg-heads attention class scores) |
-| `--visualize-attention` | `False` | Add a second row of panels to each figure using the attention-based class distribution |
 | `--fit-ridge` | `False` | At each stage, fit a Ridge model on (grouped-patch-features, quality-logit targets) and use it for pooling instead of TabICL weights. Model saved per stage. |
 | `--ridge-alpha` | `1.0` | Ridge regularisation strength. Pass one value for all stages or one per stage. |
 | `--normalize-features` | `False` | Fit a `StandardScaler` on training patches before Ridge fitting; scaler is applied at predict time too |
@@ -273,19 +275,33 @@ This runs:
 
 ## Key functions
 
+**`adaptive_patch_pooling/patch_pooling.py`**
+
 | Function | Purpose |
 |----------|---------|
-| `_get_image_paths(dataset_path, split, seed)` | Reconstruct ordered image paths + integer labels from CSV, replicating the extraction-time shuffle |
-| `_attn_class_scores(attn_weights, labels, n_classes, n_train, head, block)` | Aggregate attention from one block/head into per-patch, per-class scores `[P, n_classes]` |
-| `_get_patch_distributions(clf, query_features, train_labels, n_classes, n_train, distribution_source)` | Return `[Q, n_classes]` from either `predict_proba` or avg-heads attention; single dispatch point used by both refinement and visual eval |
 | `compute_patch_entropy(patch_probs)` | Per-patch Shannon entropy in nats `[P]` |
 | `compute_patch_pooling_weights(dist, true_label, temperature, weight_method, gamma)` | Logit / prob / entropy weighting → pooling weights `[P]` summing to 1 |
 | `compute_patch_quality_logits(dist, true_label, temperature, weight_method, gamma)` | Pre-normalisation quality logits `[P]`; used as Ridge regression targets |
 | `group_patches(patches, patch_group_size)` | Mean-pool spatially adjacent patches into groups; `[N, P, D]` → `[N, P', D]` |
-| `_pool_features_with_clf(grouped_patches, labels, support_labels, clf, scoring_pca, ...)` | Pool grouped patches using quality weights from a **pre-fitted** classifier; scoring in PCA space, pooling in raw DINO space. Used for test query pooling at each stage. |
-| `refine_dataset_features(train_patches, train_labels, support, pca, ...)` | Full refinement pass for one stage; returns `(refined [N,d], new_pca, weights_all [N,P'], ridge_model, feature_scaler, clf)` where `clf` is the scorer fitted on the input support |
-| `_compute_accuracy(support, labels, test_patches, test_labels, pca, ...)` | Test-set accuracy using mean-pooled test queries (used for baseline) |
-| `_compute_accuracy_from_features(support, labels, query_features, query_labels, ...)` | Test-set accuracy from pre-projected query features (used after explicit query pooling in iterative stages) |
-| `_run_visual_eval(tag, support, train_labels, split_configs, ...)` | Visual evaluation loop for one stage; fits classifier on `support`, saves per-image heatmaps and summary chart |
-| `_visualise_image(image, patch_probs, true_label, ..., attn_avg_scores)` | Build a 1- or 2-row figure; each row is generated by the inner `_dist_panels(dist, label)` closure |
+| `_ridge_pool_weights(patches, ridge_model, feature_scaler)` | Per-patch softmax weights from a fitted Ridge model `[N, P]` |
+| `_mix_and_project(repooled_raw, raw_patches, mix_lambda, pca, seed)` | Mix-lambda blend with mean-pool and re-fit PCA |
+| `_pool_features_with_clf(grouped_patches, labels, clf, scoring_pca, ...)` | Pool grouped patches using quality weights from a **pre-fitted** classifier; scoring in PCA space, pooling in raw DINO space |
+| `refine_dataset_features(train_patches, train_labels, support, pca, ...)` | Full refinement pass for one stage; returns `(refined [N,d], new_pca, weights_all [N,P'], ridge_model, feature_scaler, clf)` |
+
+**`adaptive_patch_pooling/patch_visualisation.py`**
+
+| Function | Purpose |
+|----------|---------|
+| `visualise_image(image, patch_probs, true_label, ...)` | Build figure with softmax-based overlay panels via the inner `_dist_panels` closure |
+| `summary_figure(results)` | Bar chart of per-image mean correct-class probability |
+
+**`local_embedding_patch_quality.py`**
+
+| Function | Purpose |
+|----------|---------|
+| `ButterflyPatchDataset` | Loads pre-extracted DINOv3 patch features from `.pt` files |
+| `_get_image_paths(dataset_path, split, seed)` | Reconstruct ordered image paths + integer labels from CSV, replicating the extraction-time shuffle |
+| `_compute_accuracy(support, labels, test_patches, test_labels, pca, ...)` | Test-set accuracy using mean-pooled test queries (baseline) |
+| `_compute_accuracy_from_features(support, labels, query_features, query_labels, ...)` | Test-set accuracy from pre-projected query features (iterative stages) |
+| `_run_visual_eval(tag, support, train_labels, split_configs, ...)` | Visual evaluation loop for one stage; saves per-image heatmaps and summary chart |
 | `run_patch_quality_eval(...)` | Top-level entry point; orchestrates baseline + iterative refinement loop |
