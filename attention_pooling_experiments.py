@@ -47,6 +47,7 @@ Training notes
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -278,6 +279,9 @@ def train_attention_pooling_head(
     best_val_acc = float("-inf")
     best_val_loss = float("inf")
     best_state: Optional[dict] = None
+    best_val_step: int = 0
+    best_time_s: float = 0.0
+    t_train_start = time.perf_counter()
 
     def _run_validation(step_for_eval: int) -> tuple[float, float]:
         assert X_val_t is not None and y_val_t is not None
@@ -357,10 +361,16 @@ def train_attention_pooling_head(
                 best_val_acc = val_acc
                 best_val_loss = val_loss
                 best_state = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
+                best_val_step = step
+                best_time_s = time.perf_counter() - t_train_start
 
     if use_validation and best_state is not None:
-        print(f"[attention pooling] Restoring best checkpoint (val_acc={best_val_acc:.4f})")
+        print(f"[attention pooling] Restoring best checkpoint (val_acc={best_val_acc:.4f}  "
+              f"step={best_val_step}  time_to_best={best_time_s:.1f}s)")
         head.load_state_dict(best_state)
+
+    history["best_val_step"] = best_val_step
+    history["time_to_best_s"] = round(best_time_s, 2)
 
     return head, history
 

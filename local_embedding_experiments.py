@@ -351,7 +351,7 @@ def _parse_args() -> argparse.Namespace:
     ext.add_argument("--dataset-path", type=Path, default=DATASET_PATH)
     ext.add_argument("--output-dir",   type=Path, default=FEATURES_DIR)
     ext.add_argument("--image-size",   type=int,  default=224)
-    ext.add_argument("--batch-size",   type=int,  default=32)
+    ext.add_argument("--batch-size",   type=int,  default=5000)
     ext.add_argument("--num-workers",  type=int,  default=4)
     ext.add_argument("--device",       type=str,  default="auto")
     ext.add_argument("--seed",         type=int,  default=42)

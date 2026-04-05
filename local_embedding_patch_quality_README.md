@@ -29,6 +29,8 @@ adaptive_patch_pooling/
 |------|-------------|
 | `extracted_features/butterfly_train_dinov3_patch_features.pt` | Pre-extracted DINOv2 patch features for the training split — `{"features": float16 [N, P, D], "labels": int64 [N]}` |
 | `extracted_features/butterfly_test_dinov3_patch_features.pt` | Same for the test split |
+| `extracted_features/butterfly_train_dinov3_features.pt` | CLS token embeddings for the training split — `{"features": float32 [N, D], "labels": int64 [N], ...}`; optional, used for the CLS-token baseline |
+| `extracted_features/butterfly_test_dinov3_features.pt` | Same for the test split (optional) |
 | `<dataset_path>/Training_set.csv` | CSV with columns `filename`, `label` — used to reconstruct image paths and class names |
 | `<dataset_path>/train/<filename>` | Raw training images (read at visualisation time only) |
 
@@ -70,15 +72,23 @@ in the baseline evaluation.
 
 ### 3. Baseline evaluation
 
-**Accuracy** (`_compute_accuracy`): test images are mean-pooled across their original
-patches, optionally PCA-transformed, and classified by TabICL fitted on the baseline
-support. Mean accuracy over the test set is reported.
+Two baselines are computed and printed before any visualisation or refinement:
 
-**Visual evaluation** (`_run_visual_eval`, tag `"baseline"`): a single `TabICLClassifier`
-is fitted on the baseline support, then each sampled image's `P` original patches are
-queried together via `clf.predict_proba`. This produces `probs [P, n_classes]` —
-per-patch TabICL softmax probabilities. A figure is saved per image (see Visualisation
-section) and a summary bar chart per split.
+**CLS-token baseline**: if `butterfly_{split}_dinov3_features.pt` files exist in
+`--features-dir`, their pre-extracted CLS token embeddings (`[N, 768]`) are loaded and
+used as a direct support set. A separate PCA (same `--pca-dim`) is fitted on the CLS
+training embeddings and applied to the test embeddings. TabICL accuracy is reported as
+`[cls-token]`.
+
+**Mean-pool baseline** (`_compute_accuracy`): test images are mean-pooled across their
+original patches, optionally PCA-transformed, and classified by TabICL fitted on the
+mean-pool baseline support. Reported as `[mean-pool]`.
+
+**Visual evaluation** (`_run_visual_eval`, tag `"baseline"`): skipped when `--n-sample 0`
+(default). Otherwise a single `TabICLClassifier` is fitted on the baseline support, then
+each sampled image's `P` original patches are queried together via `clf.predict_proba`.
+This produces `probs [P, n_classes]` — per-patch TabICL softmax probabilities. A figure
+is saved per image (see Visualisation section) and a summary bar chart per split.
 
 ### 4. Iterative multi-scale refinement (optional, `--refine`)
 
@@ -202,7 +212,8 @@ reflect the exact quality signal that drove the pooling weights.
 
 ```
 <output_dir>/
-  baseline/
+  results.json                           # always written (see Results section below)
+  baseline/                              # only when --n-sample > 0
     train/
       patch_quality_00_img42_Monarch.png
       patch_quality_01_img7_Swallowtail.png
@@ -210,7 +221,7 @@ reflect the exact quality signal that drove the pooling weights.
       summary.png
     test/
       ...
-  iter_0_g4/          # stage 0, group_size=4  (only when --refine is set)
+  iter_0_g4/          # stage 0, group_size=4  (only when --refine is set and --n-sample > 0)
     train/
       ...
     test/
@@ -220,6 +231,45 @@ reflect the exact quality signal that drove the pooling weights.
   ridge_quality_model_iter_0_g4.joblib   # only when --fit-ridge
   ridge_quality_model_iter_1_g1.joblib
 ```
+
+### Results file (`results.json`)
+
+Written to `<output_dir>/results.json` at the end of every run (with or without
+`--refine`, with or without `--n-sample`). Structure:
+
+```json
+{
+  "run_timestamp": "2026-04-04T12:00:00+00:00",
+  "total_time_s": 142.3,
+  "args": { "weight_method": "logit", "patch_group_sizes": [4, 1], "seed": 42, ... },
+  "dataset": {
+    "n_train": 5200, "n_test": 1299,
+    "n_patches": 256, "embed_dim": 768, "n_classes": 75, "pca_dim": 128
+  },
+  "baselines": {
+    "cls_token": 0.812345,   // null if CLS feature files not found
+    "mean_pool": 0.793210
+  },
+  "stages": [
+    {
+      "tag": "baseline",
+      "test_accuracy": 0.793210, "delta_acc": 0.0,
+      "mean_prob_train": NaN, "mean_prob_test": NaN,   // NaN when --n-sample 0
+      "refine_time_s": 0.0, "eval_time_s": 0.0
+    },
+    {
+      "tag": "iter_0_g4",
+      "test_accuracy": 0.821000, "delta_acc": 0.02779,
+      "mean_prob_train": 0.412, "mean_prob_test": 0.398,
+      "refine_time_s": 38.4, "eval_time_s": 12.1
+    }
+  ]
+}
+```
+
+`refine_time_s` covers the full `refine_dataset_features` call (TabICL scoring + Ridge
+fitting + support repooling + PCA refit). `eval_time_s` covers the final
+`_compute_accuracy_from_features` call on the test set for that stage.
 
 ---
 
@@ -233,7 +283,7 @@ python local_embedding_patch_quality.py [OPTIONS]
 |----------|---------|-------------|
 | `--features-dir` | `extracted_features/` | Directory with `.pt` feature files |
 | `--dataset-path` | `/project/.../butterfly-image-classification` | Dataset root (for CSV and images) |
-| `--n-sample` | `8` | Number of images to visualise per split |
+| `--n-sample` | `0` | Number of images to visualise per split; `0` skips all visualisation |
 | `--n-train` | `None` | Limit the support set to this many training images (random subsample); uses `--seed` |
 | `--n-estimators` | `1` | TabICL ensemble size |
 | `--pca-dim` | `128` | PCA output dimension; applies to both support and queries |
@@ -301,7 +351,8 @@ This runs:
 |----------|---------|
 | `ButterflyPatchDataset` | Loads pre-extracted DINOv3 patch features from `.pt` files |
 | `_get_image_paths(dataset_path, split, seed)` | Reconstruct ordered image paths + integer labels from CSV, replicating the extraction-time shuffle |
-| `_compute_accuracy(support, labels, test_patches, test_labels, pca, ...)` | Test-set accuracy using mean-pooled test queries (baseline) |
-| `_compute_accuracy_from_features(support, labels, query_features, query_labels, ...)` | Test-set accuracy from pre-projected query features (iterative stages) |
-| `_run_visual_eval(tag, support, train_labels, split_configs, ...)` | Visual evaluation loop for one stage; saves per-image heatmaps and summary chart |
+| `_compute_accuracy(support, labels, test_patches, test_labels, pca, ...)` | Test-set accuracy using mean-pooled test queries (mean-pool baseline) |
+| `_compute_accuracy_from_features(support, labels, query_features, query_labels, ...)` | Test-set accuracy from pre-projected query features (CLS baseline + iterative stages) |
+| `_run_visual_eval(tag, support, train_labels, split_configs, ...)` | Visual evaluation loop for one stage; saves per-image heatmaps and summary chart; no-op when `n_sample=0` |
+| `_save_results(output_dir, run_ts, cli_args, total_time_s, ...)` | Serialise experiment record (args, dataset info, baselines, per-stage accuracy + timing) to `results.json` |
 | `run_patch_quality_eval(...)` | Top-level entry point; orchestrates baseline + iterative refinement loop |

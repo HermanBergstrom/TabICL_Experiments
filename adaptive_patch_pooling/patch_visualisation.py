@@ -157,16 +157,17 @@ def visualise_image(
 def summary_figure(results: list[dict]) -> plt.Figure:
     """Bar chart of per-image mean correct-class probability."""
     fig, ax = plt.subplots(figsize=(max(6, len(results) * 1.2), 4))
-    xs     = np.arange(len(results))
-    probs  = [r["mean_correct_prob"] for r in results]
-    labels = [r["class_name"]        for r in results]
-    ax.bar(xs, probs, color="steelblue")
-    ax.axhline(np.mean(probs), color="red", linestyle="--", label=f"mean={np.mean(probs):.3f}")
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    if results:
+        xs     = np.arange(len(results))
+        probs  = [r["mean_correct_prob"] for r in results]
+        labels = [r["class_name"]        for r in results]
+        ax.bar(xs, probs, color="steelblue")
+        ax.axhline(np.mean(probs), color="red", linestyle="--", label=f"mean={np.mean(probs):.3f}")
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+        ax.legend()
     ax.set_ylabel("Mean P(true class) across patches")
     ax.set_ylim(0, 1)
     ax.set_title("Per-image patch prediction quality")
-    ax.legend()
     fig.tight_layout()
     return fig

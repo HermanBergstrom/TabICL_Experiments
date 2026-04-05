@@ -5,6 +5,7 @@ Functions here are pure NumPy/sklearn — no I/O, no visualisation.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import numpy as np
@@ -209,7 +210,10 @@ def group_patches(patches: np.ndarray, patch_group_size: int) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Shape ``[N, P', D]`` or ``[P', D]`` where ``P' = P // patch_group_size``.
+        Shape ``[N, P', D]`` or ``[P', D]`` where
+        ``P' = ceil(sqrt(P) / group_side) ** 2``.
+        When the grid side is not divisible by ``group_side``, boundary groups
+        cover fewer patches (equivalent to ``ceil_mode=True`` avg-pooling).
         Dtype is preserved from *patches*.
     """
     if patch_group_size == 1:
@@ -229,19 +233,32 @@ def group_patches(patches: np.ndarray, patch_group_size: int) -> np.ndarray:
     n_side = int(round(P ** 0.5))
     if n_side * n_side != P:
         raise ValueError(f"P={P} is not a perfect square; cannot form a spatial grid")
-    if n_side % group_side != 0:
-        raise ValueError(
-            f"Grid side {n_side} is not divisible by group_side {group_side} "
-            f"(patch_group_size={patch_group_size})"
-        )
 
-    new_n_side = n_side // group_side
-    # Reshape into spatial blocks and average within each block
-    grouped = (
-        patches
-        .reshape(N, new_n_side, group_side, new_n_side, group_side, D)
-        .mean(axis=(2, 4))          # [N, new_n_side, new_n_side, D]
-    ).reshape(N, new_n_side * new_n_side, D)
+    new_n_side = math.ceil(n_side / group_side)
+
+    if n_side % group_side == 0:
+        # Fast path: exact divisibility — no padding needed
+        grouped = (
+            patches
+            .reshape(N, new_n_side, group_side, new_n_side, group_side, D)
+            .mean(axis=(2, 4))          # [N, new_n_side, new_n_side, D]
+        ).reshape(N, new_n_side * new_n_side, D)
+    else:
+        # Pad spatial dims to next multiple of group_side, then average only
+        # valid elements (ceil_mode equivalent — boundary groups are smaller).
+        pad = new_n_side * group_side - n_side
+        x = patches.astype(np.float32).reshape(N, n_side, n_side, D)
+        x = np.pad(x, ((0, 0), (0, pad), (0, pad), (0, 0)), mode="constant", constant_values=0.0)
+        # Count valid patches per output cell (shared across N and D)
+        valid = np.ones((n_side, n_side), dtype=np.float32)
+        valid = np.pad(valid, ((0, pad), (0, pad)), mode="constant", constant_values=0.0)
+        counts = valid.reshape(new_n_side, group_side, new_n_side, group_side).sum(axis=(1, 3))  # [new_n_side, new_n_side]
+        # Sum within each group then divide by valid count
+        grouped_sum = (
+            x.reshape(N, new_n_side, group_side, new_n_side, group_side, D)
+            .sum(axis=(2, 4))           # [N, new_n_side, new_n_side, D]
+        )
+        grouped = (grouped_sum / counts[None, :, :, None]).reshape(N, new_n_side * new_n_side, D)
 
     if single:
         grouped = grouped[0]
@@ -284,7 +301,7 @@ def _mix_and_project(
     Returns the projected features [N, d] and the newly fitted PCA (or None).
     """
     if mix_lambda < 1.0:
-        mean_pooled_raw = raw_patches.mean(axis=1)
+        mean_pooled_raw = raw_patches.astype(np.float32).mean(axis=1)
         mixed_raw = (mix_lambda * repooled_raw + (1.0 - mix_lambda) * mean_pooled_raw).astype(np.float32)
     else:
         mixed_raw = repooled_raw
@@ -296,165 +313,207 @@ def _mix_and_project(
 
 
 # ---------------------------------------------------------------------------
-# Batched quality-weighted pooling
-# ---------------------------------------------------------------------------
-
-def _pool_features_with_clf(
-    grouped_patches: np.ndarray,     # [N, P', D]
-    labels:          np.ndarray,     # [N]   true label per image (for weight computation)
-    clf:             TabICLClassifier,
-    scoring_pca:     Optional[PCA],  # PCA that was fitted on the support
-    temperature:     float,
-    weight_method:   str,
-    gamma:           float,
-    batch_size:      int,
-    desc:            str = "Pooling",
-) -> tuple[np.ndarray, np.ndarray]:     # (repooled_raw [N, D], weights [N, P'])
-    """Pool grouped patches using quality weights from a pre-fitted TabICL classifier.
-
-    Scoring is performed in the PCA-projected space that matches the support, while
-    the weighted pooling is applied to the raw (pre-PCA) grouped patch features so
-    that distances in the output space are not distorted by a PCA fitted on a
-    different set of vectors.
-    """
-    N, P, D = grouped_patches.shape
-    repooled_raw = np.zeros((N, D), dtype=np.float32)
-    weights_all  = np.zeros((N, P), dtype=np.float32)
-
-    for batch_start in tqdm(range(0, N, batch_size), desc=desc, unit="batch", leave=False):
-        batch_end = min(batch_start + batch_size, N)
-        batch     = grouped_patches[batch_start:batch_end]   # [B, P', D]
-        B         = batch_end - batch_start
-
-        query_raw:  np.ndarray = batch.reshape(B * P, D)
-        query_feat: np.ndarray = (
-            scoring_pca.transform(query_raw) if scoring_pca is not None else query_raw
-        )
-
-        probs = clf.predict_proba(query_feat)          # [B*P', n_classes]
-        probs = probs.reshape(B, P, -1)                # [B, P', n_classes]
-
-        for j in range(B):
-            idx        = batch_start + j
-            true_label = int(labels[idx])
-            weights    = compute_patch_pooling_weights(
-                probs[j], true_label, temperature, weight_method, gamma
-            )
-            weights_all[idx]  = weights
-            repooled_raw[idx] = (weights[:, None] * batch[j]).sum(axis=0)
-
-    return repooled_raw, weights_all
-
-
-# ---------------------------------------------------------------------------
 # Full refinement pass
 # ---------------------------------------------------------------------------
 
 def refine_dataset_features(
-    train_patches:    np.ndarray,      # [N, P, D]  raw DINO patch features
-    train_labels:     np.ndarray,      # [N]
-    support_features: np.ndarray,      # [N, d]  initial mean-pooled (post-PCA) features
-    pca:              Optional[PCA],   # PCA fitted on the baseline support set
-    n_estimators:     int   = 1,
-    temperature:      float = 1.0,
-    seed:             int   = 42,
-    batch_size:       int   = 100,
-    weight_method:    str   = "logit",
-    gamma:            float = 1.0,
-    mix_lambda:       float = 1.0,
-    fit_ridge:        bool  = False,
-    ridge_alpha:      float = 1.0,
-    normalize_features: bool = False,
-) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Optional[Ridge], Optional[StandardScaler], TabICLClassifier]:
-    """Replace mean-pooled support features with quality-weighted patch pooling,
-    and optionally fit a Ridge regressor on the patch quality logits — all in a
-    single TabICL forward pass over the training set.
+    train_patches:      np.ndarray,      # [N, P, D]  raw DINO patch features
+    train_labels:       np.ndarray,      # [N]
+    support_features:   np.ndarray,      # [N, d]  initial mean-pooled (post-PCA) features
+    pca:                Optional[PCA],   # PCA fitted on the baseline support set
+    n_estimators:       int   = 1,
+    temperature:        float = 1.0,
+    seed:               int   = 42,
+    batch_size:         int   = 100,
+    weight_method:      str   = "logit",
+    gamma:              float = 1.0,
+    mix_lambda:         float = 1.0,
+    ridge_alpha:        float = 1.0,
+    normalize_features: bool  = False,
+    max_query_rows:        Optional[int]       = None,
+    use_random_subsampling: bool               = False,
+    aoe_mask:              Optional[np.ndarray] = None,  # [N] bool; True = absence-of-evidence class
+    aoe_handling:          str                 = "filter",  # "filter" | "entropy"
+) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Ridge, Optional[StandardScaler], TabICLClassifier]:
+    """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
+
+    A TabICL classifier fitted on the *input* support is used solely to generate
+    quality-logit training targets for a Ridge regressor.  The Ridge model then
+    predicts per-patch quality logits from raw DINO features and drives the final
+    pooling — making the pooling label-free and fast at inference time.
+
+    If *aoe_mask* is provided, its effect on steps 2–4 depends on *aoe_handling*:
+
+    ``"filter"``
+        AoE-class images are excluded from the TabICL forward pass and Ridge
+        fitting entirely.  The Ridge model sees only non-AoE patches.
+
+    ``"entropy"``
+        AoE-class images are included, but their per-patch quality logits are
+        computed with the ``"entropy_logit"`` method regardless of *weight_method*.
+        This lets the Ridge model learn AoE-patch quality without relying on labels.
+
+    In both cases, AoE-class images are still included in the Ridge-based support
+    pooling (step 5) and in the returned refined support.
 
     Flow
     ----
-    1. Query TabICL in batches of *batch_size* images against the *initial*
-       mean-pooled support to get per-patch class distributions.
-    2. Derive pooling weights via *weight_method* (see compute_patch_pooling_weights).
-       If *fit_ridge* is True, also compute the pre-normalisation quality logits
-       (compute_patch_quality_logits) and store them alongside the raw patch features.
-    3. Apply weights to the **raw DINO** patch features → repooled [N, D] features.
-    4. Mix with original mean-pooled raw features:
-       ``mixed_raw = mix_lambda * repooled_raw + (1 - mix_lambda) * mean_pooled_raw``
-    5. Re-fit PCA on *mixed_raw*.
-    6. If *fit_ridge* is True, fit Ridge(alpha=*ridge_alpha*) on the collected
-       [N*P, D] raw features and [N*P] logit targets.
+    1. Fit a ``TabICLClassifier`` on *support_features* (fixed scorer for this stage).
+    2. Collect ``(patch_feature, quality_logit)`` pairs for Ridge fitting:
+
+       - **Default** (``max_query_rows`` is ``None`` or active rows ≤ ``max_query_rows``):
+         forward all active patch rows in batches of *batch_size*.
+       - **Subsampled** (active rows > ``max_query_rows``): draw *max_query_rows*
+         ``(image, patch)`` pairs uniformly at random from active images and
+         forward them in a single pass.  The fraction of rows forwarded is printed.
+
+    3. Optionally fit a ``StandardScaler`` on the collected patch features
+       (``normalize_features=True``).
+    4. Fit ``Ridge(alpha=ridge_alpha)`` on the collected pairs.
+    5. Predict quality logits for **all** patches of **all** images with Ridge
+       (full-image pooling including AoE-class images, regardless of step 2).
+    6. Apply softmax weights derived from Ridge logits → ``repooled_raw [N, D]``.
+    7. Mix with mean-pooled raw features (``mix_lambda``) and re-fit PCA.
 
     Returns
     -------
     mixed : np.ndarray, shape [N, d]
     new_pca : PCA or None
-    weights_all : np.ndarray, shape [N, P]
-    ridge_model : Ridge or None
+    weights_ridge : np.ndarray, shape [N, P]   (Ridge softmax weights, full images)
+    ridge_model : Ridge
     feature_scaler : StandardScaler or None
-    clf : TabICLClassifier  (the classifier fitted on the *input* support_features)
+    clf : TabICLClassifier  (scorer fitted on the *input* support_features)
     """
     N, P, D = train_patches.shape
-    repooled_raw = np.zeros((N, D), dtype=np.float32)
-    weights_all  = np.zeros((N, P), dtype=np.float32)
 
-    if fit_ridge:
-        all_features = np.empty((N * P, D), dtype=np.float32)
-        all_targets  = np.empty(N * P,      dtype=np.float32)
+    # Determine which images contribute to Ridge fitting and their per-image method.
+    # "filter": only non-AoE images; all use weight_method.
+    # "entropy": all images; AoE images use "entropy_logit" instead of weight_method.
+    if aoe_mask is not None and aoe_handling == "filter":
+        active_indices = np.where(~aoe_mask)[0]
+    else:
+        active_indices = np.arange(N)
+    N_active          = len(active_indices)
+    active_patches    = train_patches[active_indices]   # [N_active, P, D]
+    active_labels     = train_labels[active_indices]    # [N_active]
+    active_total_rows = N_active * P
 
-    # Fit one shared classifier (support set is fixed for all queries)
-    n_classes = int(train_labels.max()) + 1
+    # Per-image effective weight method (None = all images use weight_method)
+    if aoe_mask is not None and aoe_handling == "entropy":
+        active_is_aoe = aoe_mask[active_indices]   # [N_active] bool
+    else:
+        active_is_aoe = None
+
+    def _eff_method(local_idx: int) -> str:
+        if active_is_aoe is not None and active_is_aoe[local_idx]:
+            return "entropy_logit"
+        return weight_method
+
+    # Fit one shared classifier (support set is fixed for all queries this stage)
     clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
     clf.fit(support_features, train_labels)
 
-    for batch_start in tqdm(range(0, N, batch_size),
-                            desc="Computing patch quality scores", unit="batch"):
-        batch_end     = min(batch_start + batch_size, N)
-        batch_patches = train_patches[batch_start:batch_end]   # [B, P, D]
-        B = batch_end - batch_start
+    # Decide forward-pass strategy:
+    #   one_pass=True  → forward a contiguous block of rows in a single predict_proba call
+    #                    (either all active rows, or a random subset when subsampling)
+    #   one_pass=False → forward in batches of batch_size images (fallback / default)
+    exceeded = max_query_rows is not None and active_total_rows > max_query_rows
+    one_pass = max_query_rows is not None and (not exceeded or use_random_subsampling)
 
-        query_raw: np.ndarray = batch_patches.reshape(B * P, D)   # [B*P, D]
-        query_features: np.ndarray = (
-            pca.transform(query_raw) if pca is not None else query_raw
-        )                                                           # [B*P, d]
+    if one_pass:
+        if exceeded:
+            # Subsampled: draw max_query_rows (image, patch) pairs from active images
+            n_fwd    = max_query_rows
+            aoe_note = f" (aoe_handling={aoe_handling})" if aoe_mask is not None else ""
+            print(f"[sampling] Subsampling {n_fwd:,} / {active_total_rows:,} patch-group rows "
+                  f"({100 * n_fwd / active_total_rows:.1f}%) for Ridge fitting{aoe_note}")
+            rng           = np.random.RandomState(seed)
+            sampled_flat  = rng.choice(active_total_rows, size=n_fwd, replace=False)
+            sampled_flat.sort()                          # sort → group by image for searchsorted
+            local_img_idx = sampled_flat // P            # index into active_patches
+            patch_idx_all = sampled_flat % P
+            query_raw     = active_patches[local_img_idx, patch_idx_all].astype(np.float32)
+            img_boundaries = np.searchsorted(local_img_idx, np.arange(N_active + 1))
+        else:
+            # All active rows in one pass; sequential layout matches reshape order
+            n_fwd          = active_total_rows
+            query_raw      = active_patches.reshape(active_total_rows, D).astype(np.float32)
+            img_boundaries = np.arange(N_active + 1) * P     # [0, P, 2P, ..., N_active*P]
 
-        probs = clf.predict_proba(query_features)                   # [B*P, n_classes]
-        probs = probs.reshape(B, P, -1)                            # [B, P, n_classes]
+        query_features = pca.transform(query_raw) if pca is not None else query_raw
+        probs_flat     = clf.predict_proba(query_features)   # [n_fwd, n_classes]
 
-        for j in range(B):
-            idx        = batch_start + j
-            true_label = int(train_labels[idx])
-            weights = compute_patch_pooling_weights(
-                probs[j], true_label, temperature, weight_method, gamma,
-            )                                                       # [P]
-            weights_all[idx] = weights
-            repooled_raw[idx] = (weights[:, None] * batch_patches[j]).sum(axis=0)  # [D]
+        all_features = query_raw
+        all_targets  = np.empty(n_fwd, dtype=np.float32)
 
-            if fit_ridge:
-                all_features[idx * P:(idx + 1) * P] = batch_patches[j]
-                all_targets [idx * P:(idx + 1) * P] = compute_patch_quality_logits(
-                    probs[j], true_label, temperature, weight_method, gamma,
+        for idx in range(N_active):
+            start, end = int(img_boundaries[idx]), int(img_boundaries[idx + 1])
+            if start == end:
+                continue
+            all_targets[start:end] = compute_patch_quality_logits(
+                probs_flat[start:end], int(active_labels[idx]),
+                temperature, _eff_method(idx), gamma,
+            )
+
+    else:
+        # Batched loop: used when max_query_rows is None, or when cap is exceeded
+        # but --use-random-subsampling was not requested.
+        all_features = np.empty((active_total_rows, D), dtype=np.float32)
+        all_targets  = np.empty(active_total_rows,      dtype=np.float32)
+        row_ptr      = 0
+
+        for batch_start in tqdm(range(0, N, batch_size),
+                                desc="Computing patch quality scores", unit="batch"):
+            batch_end = min(batch_start + batch_size, N)
+            # For "filter" mode, exclude AoE images from the batch.
+            # For "entropy" mode (and no AoE), include all images.
+            if aoe_mask is not None and aoe_handling == "filter":
+                active_in_batch = [j for j in range(batch_start, batch_end) if not aoe_mask[j]]
+                if not active_in_batch:
+                    continue
+                batch_patches_arr = train_patches[active_in_batch]   # [B_a, P, D]
+                batch_labels_arr  = train_labels[active_in_batch]
+                batch_is_aoe      = None
+            else:
+                batch_patches_arr = train_patches[batch_start:batch_end]   # [B, P, D]
+                batch_labels_arr  = train_labels[batch_start:batch_end]
+                batch_is_aoe      = (aoe_mask[batch_start:batch_end]
+                                     if aoe_mask is not None else None)
+
+            B_a = len(batch_patches_arr)
+            query_raw      = batch_patches_arr.reshape(B_a * P, D)
+            query_features = pca.transform(query_raw) if pca is not None else query_raw
+
+            probs = clf.predict_proba(query_features).reshape(B_a, P, -1)   # [B_a, P, n_classes]
+
+            for j in range(B_a):
+                eff = ("entropy_logit"
+                       if batch_is_aoe is not None and batch_is_aoe[j]
+                       else weight_method)
+                all_features[row_ptr * P:(row_ptr + 1) * P] = batch_patches_arr[j]
+                all_targets [row_ptr * P:(row_ptr + 1) * P] = compute_patch_quality_logits(
+                    probs[j], int(batch_labels_arr[j]), temperature, eff, gamma,
                 )
+                row_ptr += 1
+
+    # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
+    feature_scaler: Optional[StandardScaler] = None
+    if normalize_features:
+        print("[ridge] Fitting StandardScaler on training patches ...")
+        feature_scaler = StandardScaler()
+        all_features = feature_scaler.fit_transform(all_features)
+
+    print(f"[ridge] Fitting Ridge(alpha={ridge_alpha}) on {len(all_features):,} patch samples "
+          f"(D={D}, method={weight_method}) ...")
+    ridge_model = Ridge(alpha=ridge_alpha)
+    ridge_model.fit(all_features, all_targets)
+    print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
+
+    # --- Pool all training images with Ridge weights (always full images) ---
+    print("[ridge] Pooling support set with Ridge-predicted weights ...")
+    weights_ridge = _ridge_pool_weights(train_patches, ridge_model, feature_scaler)   # [N, P]
+    repooled_raw  = (weights_ridge[:, :, None] * train_patches).sum(axis=1)           # [N, D]
 
     mixed, new_pca = _mix_and_project(repooled_raw, train_patches, mix_lambda, pca, seed)
 
-    ridge_model: Optional[Ridge] = None
-    feature_scaler: Optional[StandardScaler] = None
-    if fit_ridge:
-        if normalize_features:
-            print("[ridge] Fitting StandardScaler on training patches ...")
-            feature_scaler = StandardScaler()
-            all_features = feature_scaler.fit_transform(all_features)
-
-        print(f"[ridge] Fitting Ridge(alpha={ridge_alpha}) on {N * P:,} patch samples "
-              f"(D={D}, method={weight_method}) ...")
-        ridge_model = Ridge(alpha=ridge_alpha)
-        ridge_model.fit(all_features, all_targets)
-        print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
-
-        # Redo support repooling using Ridge-predicted quality logits
-        print("[ridge] Repooling support set with Ridge-predicted weights ...")
-        weights_ridge = _ridge_pool_weights(train_patches, ridge_model, feature_scaler)
-        repooled_raw  = (weights_ridge[:, :, None] * train_patches).sum(axis=1)  # [N, D]
-        mixed, new_pca = _mix_and_project(repooled_raw, train_patches, mix_lambda, pca, seed)
-
-    return mixed, new_pca, weights_all, ridge_model, feature_scaler, clf
+    return mixed, new_pca, weights_ridge, ridge_model, feature_scaler, clf
