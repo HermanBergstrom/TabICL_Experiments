@@ -58,12 +58,15 @@ def visualise_image(
     patch_size:        int   = 16,
     alpha:             float = 0.55,
     temperature:       float = 1.0,
-    gamma:             float = 1.0,
-    weight_method:     str   = "logit",
     ridge_pred_logits: Optional[np.ndarray] = None,   # [P]  Ridge-predicted quality logits
+    class_prior:       Optional[np.ndarray] = None,   # [n_classes]  empirical class frequencies
+    weight_method:     str   = "correct_class_prob",  # method used for refinement (highlighted)
 ) -> plt.Figure:
     """Figure with overlay panels showing per-patch softmax quality scores.
-    Panels: original | P(true) | logit weights | entropy | entropy/entropy-logit weights
+
+    Panels: original | P(true) | ccp weights | entropy weights | kl_div weights
+            [+ Ridge weights when ridge_pred_logits is provided]
+    The panel corresponding to weight_method is marked with ★ in its title.
     """
     P      = len(patch_probs)
     n_side = int(round(P ** 0.5))
@@ -82,32 +85,36 @@ def visualise_image(
     def _up(vals: np.ndarray) -> np.ndarray:
         return _upscale_grid(vals, n_side, patch_size)
 
+    def _mark(title: str, method: str) -> str:
+        """Append ★ to panel title when method matches the active weight_method."""
+        return f"{title}  ★" if method == weight_method else title
+
     def _dist_panels(dist: np.ndarray, label: str) -> list[tuple[str, Optional[np.ndarray], dict]]:
-        """Build the 6 panels (original + 5 overlays) for a [P, n_classes] distribution."""
-        p_true          = dist[:, true_label]
-        e_norm          = compute_patch_entropy(dist) / np.log(n_classes)
-        w_logit         = compute_patch_pooling_weights(dist, true_label, temperature, "logit",         gamma)
-        w_entropy_logit = compute_patch_pooling_weights(dist, true_label, temperature, "entropy_logit", gamma)
-        w_combined      = compute_patch_pooling_weights(dist, true_label, temperature, "combined",      gamma)
-        if weight_method in ("entropy_logit", "combined"):
-            w_entropy_panel     = w_entropy_logit
-            entropy_panel_title = "Entropy-logit pooling weights"
-        else:
-            w_entropy_panel     = compute_patch_pooling_weights(dist, true_label, temperature, "entropy", gamma)
-            entropy_panel_title = "Entropy pooling weights"
-        return [
+        """Build overlay panels for a [P, n_classes] distribution.
+
+        Panels: original | P(true) | ccp weights | entropy weights | kl_div weights.
+        The panel whose method matches weight_method is marked with ★.
+        kl_div panel is always shown (class_prior is always provided by the runner).
+        """
+        p_true    = dist[:, true_label]
+        w_ccp     = compute_patch_pooling_weights(dist, true_label, temperature, "correct_class_prob")
+        w_entropy = compute_patch_pooling_weights(dist, true_label, temperature, "entropy")
+        panels = [
             (f"Original image\n[{label}]", None, {}),
             (f"P(true class)  (mean={p_true.mean():.3f})",
              p_true, {"vmin": 0.0, "vmax": 1.0}),
-            ("Logit pooling weights",
-             w_logit, {"vmin": w_logit.min(), "vmax": w_logit.max()}),
-            (f"Entropy (normalised)  (mean={e_norm.mean():.3f})",
-             e_norm, {"cmap": "RdYlGn_r", "vmin": e_norm.min(), "vmax": e_norm.max()}),
-            (entropy_panel_title,
-             w_entropy_panel, {"vmin": w_entropy_panel.min(), "vmax": w_entropy_panel.max()}),
-            ("Combined pooling weights",
-             w_combined, {"vmin": w_combined.min(), "vmax": w_combined.max()}),
+            (_mark("Correct-class-prob weights", "correct_class_prob"),
+             w_ccp, {"vmin": w_ccp.min(), "vmax": w_ccp.max()}),
+            (_mark("Entropy weights", "entropy"),
+             w_entropy, {"vmin": w_entropy.min(), "vmax": w_entropy.max()}),
         ]
+        if class_prior is not None:
+            w_kl = compute_patch_pooling_weights(
+                dist, true_label, temperature, "kl_div", class_prior
+            )
+            panels.append((_mark("KL-div weights", "kl_div"),
+                           w_kl, {"vmin": w_kl.min(), "vmax": w_kl.max()}))
+        return panels
 
     all_rows = [_dist_panels(patch_probs, "Softmax")]
 

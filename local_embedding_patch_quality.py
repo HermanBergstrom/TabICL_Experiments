@@ -199,7 +199,8 @@ def _load_features(
     dtype:        torch.dtype = torch.float32,
     backbone:     str = "rad-dino",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           Optional[np.ndarray], Optional[np.ndarray], dict[int, str]]:
+           Optional[np.ndarray], Optional[np.ndarray], dict[int, str],
+           Optional[np.ndarray]]:
     """Load patch and CLS features for the requested dataset.
 
     Returns:
@@ -210,8 +211,13 @@ def _load_features(
         cls_train:       [N_train, D] or None
         cls_test:        [N_test,  D] or None
         idx_to_class:    {int → class_name}
+        train_sub_idx:   [N_train] int64 or None — indices into the original full training set
+                         that were selected; None when no subsampling was applied.  Callers
+                         that maintain a parallel list of training image paths must apply
+                         the same selection to keep alignment with train_patches.
     """
     features_dir = Path(features_dir)
+    train_sub_idx: Optional[np.ndarray] = None
 
     if dataset == "butterfly":
         train_ds = ButterflyPatchDataset(features_dir, split="train", dtype=dtype)
@@ -274,6 +280,7 @@ def _load_features(
             rng     = np.random.RandomState(seed)
             sub_idx = rng.choice(n_orig, size=n_train, replace=False)
             sub_idx.sort()
+            train_sub_idx = sub_idx
             train_labels  = train_labels[sub_idx]
             # Slice the torch tensor before .numpy() — avoids materialising the
             # full [N, P, D] array in RAM (critical for large datasets).
@@ -307,13 +314,14 @@ def _load_features(
         rng     = np.random.RandomState(seed)
         sub_idx = rng.choice(n_orig, size=n_train, replace=False)
         sub_idx.sort()
+        train_sub_idx = sub_idx
         train_patches = train_patches[sub_idx]
         train_labels  = train_labels[sub_idx]
         if cls_train is not None:
             cls_train = cls_train[sub_idx]
         print(f"[info] Training set subsampled: {n_train} / {n_orig} images")
 
-    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class
+    return train_patches, train_labels, test_patches, test_labels, cls_train, cls_test, idx_to_class, train_sub_idx
 
 
 def _balance_classes(
@@ -321,11 +329,16 @@ def _balance_classes(
     labels:    np.ndarray,           # [N]
     cls_feats: Optional[np.ndarray], # [N, D] or None
     rng:       np.random.RandomState,
-) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Undersample majority classes so every class has the same number of examples.
 
     Samples are drawn without replacement.  The returned arrays are in a
     random (shuffled) order so the caller does not need to shuffle again.
+
+    Returns (patches, labels, cls_feats, keep_idx) where keep_idx are the
+    indices into the input arrays that were selected, in the returned order.
+    Callers that maintain parallel lists (e.g. image paths) must apply the
+    same keep_idx to stay aligned.
     """
     classes, counts = np.unique(labels, return_counts=True)
     n_min = int(counts.min())
@@ -343,7 +356,7 @@ def _balance_classes(
     orig_counts_str = "  ".join(f"cls{c}:{n}" for c, n in zip(classes, counts))
     print(f"[balance] {len(labels)} → {len(bal_labels)} samples  "
           f"({n_min} per class)  was: {orig_counts_str}")
-    return bal_patches, bal_labels, bal_cls
+    return bal_patches, bal_labels, bal_cls, keep_idx
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +424,11 @@ def _run_visual_eval(
     seed:             int,
     output_dir:       Path,
     temperature:      float = 1.0,
-    gamma:            float = 1.0,
-    weight_method:    str   = "logit",
     ridge_model:      Optional[Ridge] = None,
     feature_scaler:   Optional[StandardScaler] = None,
     open_image:       Optional[Callable[[Path], Image.Image]] = None,
+    class_prior:      Optional[np.ndarray] = None,   # [n_classes] empirical class frequencies
+    weight_method:    str   = "correct_class_prob",
 ) -> dict[str, float]:
     """Run the patch-quality visual evaluation for one support set variant.
 
@@ -476,9 +489,9 @@ def _run_visual_eval(
                 n_classes=n_classes,
                 patch_size=patch_size,
                 temperature=temperature,
-                gamma=gamma,
-                weight_method=weight_method,
                 ridge_pred_logits=ridge_pred_logits,
+                class_prior=class_prior,
+                weight_method=weight_method,
             )
             out_path = (
                 split_out_dir
@@ -555,10 +568,12 @@ def _save_results(
                 "delta_auroc":     _fmt(auroc - baseline_auroc) if not np.isnan(auroc) and not np.isnan(baseline_auroc) else None,
                 "mean_prob_train": round(float(mean_probs.get("train", float("nan"))), 6),
                 "mean_prob_test":  round(float(mean_probs.get("test",  float("nan"))), 6),
+                "fit_time_s":      round(fit_s,    2),
+                "pool_time_s":     round(pool_s,   2),
                 "refine_time_s":   round(refine_s, 2),
-                "eval_time_s":     round(eval_s, 2),
+                "eval_time_s":     round(eval_s,   2),
             }
-            for stage_name, acc, auroc, mean_probs, refine_s, eval_s in all_results
+            for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s in all_results
         ],
     }
     results_path = output_dir / "results.json"
@@ -707,8 +722,7 @@ def run_patch_quality_eval(
     refine:            bool          = False,
     temperature:       float         = 1.0,
     batch_size:        int           = 10,
-    weight_method:     str           = "logit",
-    gamma:             float         = 1.0,
+    weight_method:     str           = "correct_class_prob",
     mix_lambda:        float         = 1.0,
     ridge_alpha:       float         = 1.0,
     normalize_features: bool         = False,
@@ -728,6 +742,7 @@ def run_patch_quality_eval(
     post_refinement_viz:    bool          = False,   # skip pre-refinement viz; show only post-refinement Ridge panels
     aoe_class:              Optional[str] = None,    # absence-of-evidence class (int index or class name)
     aoe_handling:           str           = "filter",  # how to handle AoE class: "filter" | "entropy"
+    gpu_ridge:              bool          = False,   # solve Ridge on GPU (requires PyTorch + CUDA)
     _cli_args:              Optional[dict] = None,   # raw CLI args for provenance logging
 ) -> None:
     output_dir = Path(output_dir)
@@ -740,7 +755,7 @@ def run_patch_quality_eval(
     (train_patches, train_labels,
      test_patches,  test_labels,
      cls_train_feats, cls_test_feats,
-     idx_to_class) = _load_features(
+     idx_to_class, train_sub_idx) = _load_features(
         dataset=dataset,
         features_dir=features_dir,
         n_train=n_train,
@@ -749,17 +764,22 @@ def run_patch_quality_eval(
     )
 
     bal_rng = np.random.RandomState(seed + 1)   # separate RNG so balancing doesn't shift other draws
+    bal_train_keep_idx: Optional[np.ndarray] = None
     if balance_train:
-        train_patches, train_labels, cls_train_feats = _balance_classes(
+        train_patches, train_labels, cls_train_feats, bal_train_keep_idx = _balance_classes(
             train_patches, train_labels, cls_train_feats, bal_rng
         )
     if balance_test:
-        test_patches, test_labels, cls_test_feats = _balance_classes(
+        test_patches, test_labels, cls_test_feats, _ = _balance_classes(
             test_patches, test_labels, cls_test_feats, bal_rng
         )
 
     N_train, _P, D = train_patches.shape
     n_classes      = int(train_labels.max()) + 1
+
+    # Empirical class prior (used by kl_div weight method and visualisation panels).
+    _counts      = np.bincount(train_labels.astype(np.int64), minlength=n_classes)
+    class_prior  = (_counts / _counts.sum()).astype(np.float32)
 
     # --- Resolve absence-of-evidence class ---
     aoe_mask: Optional[np.ndarray] = None
@@ -865,6 +885,13 @@ def run_patch_quality_eval(
             test_image_paths,  _, _ = _get_rsna_image_paths(dataset_path, features_dir, split="test",  backbone=backbone)
             open_image = _dicom_to_pil
 
+        # Keep train_image_paths aligned with train_patches by applying the same
+        # index selections that _load_features and _balance_classes applied.
+        if train_sub_idx is not None:
+            train_image_paths = [train_image_paths[i] for i in train_sub_idx]
+        if bal_train_keep_idx is not None:
+            train_image_paths = [train_image_paths[i] for i in bal_train_keep_idx]
+
     rng              = np.random.RandomState(seed)
     train_sample_idx = rng.choice(len(train_labels), size=min(n_sample, len(train_labels)), replace=False)
     test_sample_idx  = rng.choice(len(test_labels),  size=min(n_sample, len(test_labels)),  replace=False)
@@ -958,8 +985,9 @@ def run_patch_quality_eval(
             "baseline", baseline_support, train_labels, split_configs_orig, idx_to_class,
             pca=pca, n_estimators=n_estimators, patch_size=patch_size,
             seed=seed, output_dir=output_dir,
-            temperature=temperatures[0], gamma=gamma, weight_method=weight_method,
+            temperature=temperatures[0],
             ridge_model=None, feature_scaler=None, open_image=open_image,
+            class_prior=class_prior, weight_method=weight_method,
         )
     else:
         baseline_mean_probs = {}
@@ -972,7 +1000,7 @@ def run_patch_quality_eval(
             n_classes=n_classes, pca=pca,
             cls_acc=cls_acc, cls_auroc=cls_auroc,
             baseline_acc=baseline_acc, baseline_auroc=baseline_auroc,
-            all_results=[("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0)],
+            all_results=[("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)],
             attn_result=attn_result,
         )
         return
@@ -990,7 +1018,7 @@ def run_patch_quality_eval(
     current_support = baseline_support
     current_pca     = pca
     all_results: list[tuple[str, float, float, dict, float, float]] = [
-        ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0)
+        ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)
     ]
 
     for stage_idx, group_size in enumerate(patch_group_sizes):
@@ -1018,29 +1046,35 @@ def run_patch_quality_eval(
                 tag, current_support, train_labels, split_configs_iter, idx_to_class,
                 pca=current_pca, n_estimators=n_estimators, patch_size=eff_patch_sz,
                 seed=seed, output_dir=output_dir,
-                temperature=stage_temp, gamma=gamma, weight_method=weight_method,
+                temperature=stage_temp,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
+                class_prior=class_prior, weight_method=weight_method,
             )
         else:
             iter_mean_probs = {}
 
         # -- Refine support (clf fitted on current_support internally) --
+        # Save pre-refinement state so the final post-all-refinement viz can use it.
+        pre_refine_support = current_support
+        pre_refine_pca     = current_pca
         print(f"[{tag}] Refining support "
               f"(method={weight_method}, T={stage_temp}) ...")
-        t_refine_start = time.perf_counter()
-        new_support, new_pca, _weights, ridge_model, feature_scaler, scoring_clf = \
+        new_support, new_pca, _weights, ridge_model, feature_scaler, scoring_clf, \
+            fit_time_s, pool_time_s = \
             refine_dataset_features(
                 train_grouped, train_labels, current_support, current_pca,
                 n_estimators=n_estimators, temperature=stage_temp, seed=seed,
-                batch_size=batch_size, weight_method=weight_method, gamma=gamma,
+                batch_size=batch_size, weight_method=weight_method,
                 mix_lambda=mix_lambda, ridge_alpha=stage_alpha,
                 normalize_features=normalize_features,
                 max_query_rows=max_query_rows,
                 use_random_subsampling=use_random_subsampling,
                 aoe_mask=aoe_mask,
                 aoe_handling=aoe_handling,
+                use_gpu_ridge=gpu_ridge,
+                gpu_ridge_device="cuda" if device == "auto" else device,
             )
-        refine_time_s = time.perf_counter() - t_refine_start
+        refine_time_s = fit_time_s + pool_time_s
 
         if ridge_model is not None:
             ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
@@ -1057,8 +1091,9 @@ def run_patch_quality_eval(
                 f"{tag}_post", current_support, train_labels, split_configs_post, idx_to_class,
                 pca=current_pca, n_estimators=n_estimators, patch_size=eff_patch_sz,
                 seed=seed, output_dir=output_dir,
-                temperature=stage_temp, gamma=gamma, weight_method=weight_method,
+                temperature=stage_temp,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
+                class_prior=class_prior, weight_method=weight_method,
             )
 
         # -- Pool test queries with Ridge (full images, same model as training) --
@@ -1078,34 +1113,52 @@ def run_patch_quality_eval(
         )
         eval_time_s = time.perf_counter() - t_eval_start
         print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
-              f"(refine {refine_time_s:.1f}s, eval {eval_time_s:.1f}s)")
+              f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
 
-        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s))
+        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
         current_support = new_support
         current_pca     = new_pca
+
+    # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
+    # Produces Ridge-weight figures for the last refinement stage, giving you the quality
+    # heatmaps even when per-stage post-refinement viz was skipped.
+    if n_sample > 0 and not post_refinement_viz and refine and ridge_model is not None:
+        split_configs_final = [
+            ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
+            ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
+        ]
+        _run_visual_eval(
+            f"{tag}_post", pre_refine_support, train_labels, split_configs_final, idx_to_class,
+            pca=pre_refine_pca, n_estimators=n_estimators, patch_size=eff_patch_sz,
+            seed=seed, output_dir=output_dir,
+            temperature=stage_temp,
+            ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
+            class_prior=class_prior, weight_method=weight_method,
+        )
 
     total_time_s = time.perf_counter() - experiment_start
 
     # --- Summary table ---
     col_w = max(len(r[0]) for r in all_results) + 2
-    print("\n" + "=" * (col_w + 70))
+    print("\n" + "=" * (col_w + 78))
     print("ITERATIVE REFINEMENT SUMMARY")
     print("=" * (col_w + 70))
     print(f"  {'Stage':<{col_w}}  {'Test Acc':>10}  {'AUROC':>8}  {'Δ Acc':>8}  "
-          f"{'P(true)/train':>14}  {'P(true)/test':>13}  {'Refine(s)':>10}  {'Eval(s)':>8}")
-    print("-" * (col_w + 70))
-    for stage_name, acc, auroc, mean_probs, refine_s, eval_s in all_results:
-        delta_str  = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
-        refine_str = "-" if stage_name == "baseline" else f"{refine_s:.1f}"
-        eval_str   = "-" if stage_name == "baseline" else f"{eval_s:.1f}"
-        auroc_str  = f"{auroc:.4f}" if not np.isnan(auroc) else "  N/A"
+          f"{'P(true)/train':>14}  {'P(true)/test':>13}  {'Fit(s)':>8}  {'Pool(s)':>8}  {'Eval(s)':>8}")
+    print("-" * (col_w + 78))
+    for stage_name, acc, auroc, mean_probs, refine_s, eval_s, fit_s, pool_s in all_results:
+        delta_str = "" if stage_name == "baseline" else f"{acc - baseline_acc:+.4f}"
+        fit_str   = "-" if stage_name == "baseline" else f"{fit_s:.1f}"
+        pool_str  = "-" if stage_name == "baseline" else f"{pool_s:.1f}"
+        eval_str  = "-" if stage_name == "baseline" else f"{eval_s:.1f}"
+        auroc_str = f"{auroc:.4f}" if not np.isnan(auroc) else "  N/A"
         print(
             f"  {stage_name:<{col_w}}  {acc:>10.4f}  {auroc_str:>8}  {delta_str:>8}"
             f"  {mean_probs.get('train', float('nan')):>14.3f}"
             f"  {mean_probs.get('test', float('nan')):>13.3f}"
-            f"  {refine_str:>10}  {eval_str:>8}"
+            f"  {fit_str:>8}  {pool_str:>8}  {eval_str:>8}"
         )
-    print("=" * (col_w + 70))
+    print("=" * (col_w + 78))
     print(f"  Total wall time: {total_time_s:.1f}s")
 
     _save_results(
@@ -1238,18 +1291,19 @@ def _parse_args() -> argparse.Namespace:
                         "Large → uniform/mean pooling; small → peaked on best patch.")
     p.add_argument("--batch-size",     type=int,   default=1000,
                    help="Number of images per TabICL call during refinement")
-    p.add_argument("--weight-method",  type=str,   default="logit",
-                   choices=["logit", "prob", "entropy", "entropy_logit", "combined"],
+    p.add_argument("--weight-method",  type=str,   default="correct_class_prob",
+                   choices=["correct_class_prob", "entropy", "kl_div"],
                    help="How to derive patch pooling weights from TabICL probabilities: "
-                        "'logit' (default) uses inverse-sigmoid + temperature-softmax; "
-                        "'prob' uses power normalisation p^gamma; "
-                        "'entropy' uses (ln(C)-H)^gamma power normalisation; "
-                        "'entropy_logit' maps normalised entropy to [0,1], applies log, "
-                        "then temperature-scaled softmax (uses --temperature, not --gamma); "
-                        "'combined' averages the logit and entropy_logit weights post-softmax")
-    p.add_argument("--gamma",          type=float, default=1.0,
-                   help="Power exponent for the 'prob' weight method "
-                        "(1 → proportional to prob, ∞ → winner-take-all, 0 → uniform)")
+                        "'correct_class_prob' (default) takes log(p_true) then applies "
+                        "temperature-scaled softmax; "
+                        "'entropy' maps normalised entropy to [0,1], applies log, "
+                        "then temperature-scaled softmax; "
+                        "'kl_div' computes KL(Q||P_prior) where P_prior is the empirical "
+                        "class frequency vector, normalises by the maximum achievable KL "
+                        "(-log(p_min)), applies log, then temperature-scaled softmax — "
+                        "rewards patches whose predictions deviate from the base rates, "
+                        "making it sensitive to class imbalance. "
+                        "All methods are controlled via --temperature.")
     p.add_argument("--mix-lambda",     type=float, default=1.0,
                    help="Interpolation weight between refined and mean-pooled embeddings "
                         "(1.0 → fully refined, 0.0 → fully mean-pooled; requires --refine)")
@@ -1315,6 +1369,9 @@ def _parse_args() -> argparse.Namespace:
                         "'entropy': include AoE patches but score them with entropy_logit "
                         "instead of --weight-method, so labels are not required for them. "
                         "(default: filter)")
+    p.add_argument("--gpu-ridge", action="store_true",
+                   help="Solve Ridge regression on the GPU (requires PyTorch + CUDA). "
+                        "Same results as CPU Ridge; fastest speedup for --patch-group-size 1.")
     p.add_argument("--post-refinement-viz", action="store_true",
                    help="Skip pre-refinement visualisations; only produce post-refinement "
                         "figures with Ridge pooling weight panels. Requires --refine.")
@@ -1353,7 +1410,6 @@ if __name__ == "__main__":
         temperature=args.temperature,
         batch_size=args.batch_size,
         weight_method=args.weight_method,
-        gamma=args.gamma,
         mix_lambda=args.mix_lambda,
         ridge_alpha=args.ridge_alpha,
         normalize_features=args.normalize_features,
@@ -1372,6 +1428,7 @@ if __name__ == "__main__":
         post_refinement_viz=args.post_refinement_viz,
         aoe_class=args.aoe_class,
         aoe_handling=args.aoe_handling,
+        gpu_ridge=args.gpu_ridge,
     )
 
     if args.n_train_sweep is not None:

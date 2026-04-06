@@ -6,7 +6,8 @@ Functions here are pure NumPy/sklearn — no I/O, no visualisation.
 from __future__ import annotations
 
 import math
-from typing import Optional
+import time
+from typing import Optional, Union
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -14,6 +15,89 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from tabicl import TabICLClassifier
 from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------------
+# GPU-accelerated Ridge (optional drop-in for sklearn Ridge)
+# ---------------------------------------------------------------------------
+
+class RidgeGPU:
+    """Ridge regression solved on the GPU via normal equations.
+
+    Solves  (Xc^T Xc + alpha * I) w = Xc^T yc  where Xc/yc are mean-centred,
+    then recovers the intercept.  This mirrors sklearn Ridge(fit_intercept=True)
+    and is a drop-in replacement with the same ``fit / predict / score`` API.
+
+    Parameters
+    ----------
+    alpha : float
+        L2 regularisation strength (same semantics as sklearn Ridge).
+    device : str
+        Torch device string, e.g. ``"cuda"``, ``"cuda:1"``, or ``"cpu"``.
+        If the requested device is not available, falls back to CPU with a warning.
+    """
+
+    def __init__(self, alpha: float = 1.0, device: str = "cuda") -> None:
+        self.alpha = alpha
+        self.device = device
+        self.coef_: Optional[np.ndarray] = None
+        self.intercept_: float = 0.0
+        self._w = None   # torch.Tensor on device
+        self._b = None   # torch.Tensor on device
+
+    def _get_device(self):
+        import torch
+        dev = torch.device(self.device)
+        if dev.type == "cuda" and not torch.cuda.is_available():
+            import warnings
+            warnings.warn(
+                f"[RidgeGPU] CUDA requested but not available; falling back to CPU.",
+                RuntimeWarning, stacklevel=3,
+            )
+            dev = torch.device("cpu")
+        return dev
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "RidgeGPU":
+        """Fit Ridge on GPU.  X: [N, D], y: [N]."""
+        import torch
+        dev = self._get_device()
+        Xt = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(dev)  # [N, D]
+        yt = torch.from_numpy(np.asarray(y, dtype=np.float32)).to(dev)  # [N]
+
+        # Mean-centre to absorb the intercept
+        X_mean = Xt.mean(0)   # [D]
+        y_mean = yt.mean()    # scalar
+        Xc = Xt - X_mean
+        yc = yt - y_mean
+
+        # Normal equations: (Xc^T Xc + alpha * I) w = Xc^T yc
+        A = Xc.T @ Xc                     # [D, D]
+        A.diagonal().add_(self.alpha)     # in-place ridge penalty
+        b_vec = Xc.T @ yc                 # [D]
+
+        w = torch.linalg.solve(A, b_vec)  # [D]
+        intercept = y_mean - X_mean @ w
+
+        self._w = w
+        self._b = intercept
+        self.coef_      = w.cpu().float().numpy()
+        self.intercept_ = intercept.item()
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict on GPU; returns CPU numpy array."""
+        import torch
+        dev = self._w.device
+        Xt = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(dev)
+        out = Xt @ self._w + self._b
+        return out.cpu().numpy()
+
+    def score(self, X: np.ndarray, y: np.ndarray) -> float:
+        """R² on CPU (matches sklearn Ridge.score)."""
+        y_pred  = self.predict(X)
+        ss_res  = float(((y - y_pred) ** 2).sum())
+        ss_tot  = float(((y - y.mean()) ** 2).sum())
+        return 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -37,17 +121,17 @@ def compute_patch_entropy(patch_probs: np.ndarray) -> np.ndarray:
 
 
 def compute_patch_pooling_weights(
-    patch_probs:   np.ndarray,   # [P, n_classes]
+    patch_probs:   np.ndarray,             # [P, n_classes]
     true_label:    int,
     temperature:   float = 1.0,
-    weight_method: str   = "logit",
-    gamma:         float = 1.0,
-) -> np.ndarray:                 # [P]  sums to 1
+    weight_method: str   = "correct_class_prob",
+    class_prior:   Optional[np.ndarray] = None,  # [n_classes]  empirical class frequencies
+) -> np.ndarray:                           # [P]  sums to 1
     """Derive per-patch pooling weights from TabICL softmax predictions.
 
     Three methods are supported, selected by *weight_method*:
 
-    ``"logit"`` (default)
+    ``"correct_class_prob"`` (default)
         1. Extract the true-class probability for each patch  →  p_i in (0, 1).
         2. Take the log-probability                           →  ln(p_i).
         3. Apply a temperature-scaled softmax across patches  →  weights w_i.
@@ -56,28 +140,7 @@ def compute_patch_pooling_weights(
         temperature = 1  : weights ∝ p_true
         temperature → 0  : all weight on the single most-confident patch
 
-    ``"prob"``
-        1. Extract the true-class probability for each patch  →  p_i in (0, 1).
-        2. Raise to the power gamma                           →  p_i ^ gamma.
-        3. Normalise to sum to 1                              →  weights w_i.
-
-        gamma = 1  : weights proportional to true-class probability
-        gamma → ∞  : all weight on the single most-confident patch (winner-take-all)
-        gamma → 0  : uniform (mean) pooling
-
     ``"entropy"``
-        1. Compute Shannon entropy H_i = -Σ p_c log p_c for each patch.
-        2. Convert to a quality score: s_i = ln(C) - H_i  (low entropy → high score).
-        3. Apply power normalisation: s_i ^ gamma, then normalise to sum to 1.
-
-        Patches that predict confidently (low entropy) receive higher weight.
-        gamma = 1  : weights proportional to ln(C) - H
-        gamma → ∞  : all weight on the single most-confident patch (winner-take-all)
-        gamma → 0  : uniform (mean) pooling
-
-        Note: *true_label* is not used by this method.
-
-    ``"entropy_logit"``
         1. Compute Shannon entropy H_i = -Σ p_c log p_c for each patch.
         2. Normalise to [0, 1]: score_i = 1 - H_i / ln(C)  (0 = max entropy, 1 = zero entropy).
         3. Apply log to get a logit: logit_i = ln(score_i)  (in (-∞, 0]).
@@ -85,36 +148,26 @@ def compute_patch_pooling_weights(
 
         temperature → ∞  : logits collapse to zero  →  uniform (mean) pooling
         temperature → 0  : all weight on the single lowest-entropy patch
-        *gamma* is not used by this method; use *temperature* to sharpen/smooth.
 
         Note: *true_label* is not used by this method.
 
-    ``"combined"``
-        Average (arithmetic mean) of the per-patch weights produced by the
-        ``"logit"`` and ``"entropy_logit"`` methods, both computed with the
-        same *temperature*.  The result is renormalised to sum to 1.
+    ``"kl_div"``
+        1. Compute KL(Q_i || P_prior) for each patch, where Q_i is the predicted
+           distribution and P_prior is the empirical class frequency vector.
+           KL measures how much the patch prediction deviates from the base rates;
+           high KL → patch is discriminative.
+        2. Normalise by the maximum achievable KL: max_KL = -ln(min_c P_prior_c),
+           attained when Q is a point mass on the rarest class  →  score_i in [0, 1].
+        3. Apply log to get a logit: logit_i = ln(score_i)  (in (-∞, 0]).
+        4. Apply temperature-scaled softmax across patches  →  weights w_i.
 
-        Combines class-discriminative information (logit uses the true-class
-        probability) with class-agnostic confidence information (entropy_logit
-        uses overall prediction sharpness).
+        Requires *class_prior* (empirical class frequencies, shape [n_classes]).
+        Unlike ``"entropy"``, this method rewards predictions that deviate from the
+        base rates, making it sensitive to class imbalance: a patch that confidently
+        predicts a rare class receives a higher score than one equally confident about
+        a common class.  Note: *true_label* is not used by this method.
     """
-    if weight_method == "prob":
-        true_class_probs = patch_probs[:, true_label].clip(1e-7, 1.0)   # [P]
-        powered = true_class_probs ** gamma                               # [P]
-        weights = powered / powered.sum()
-        return weights                                                     # [P]
-
     if weight_method == "entropy":
-        n_classes = patch_probs.shape[1]
-        raw_entropy = compute_patch_entropy(patch_probs)          # [P] in [0, ln(C)]
-        scores = (np.log(n_classes) - raw_entropy).clip(0.0)      # [P] in [0, ln(C)]
-        powered = scores ** gamma                                  # [P]
-        total = powered.sum()
-        if total > 0:
-            return powered / total
-        return np.full(len(powered), 1.0 / len(powered), dtype=np.float32)
-
-    if weight_method == "entropy_logit":
         n_classes = patch_probs.shape[1]
         raw_entropy = compute_patch_entropy(patch_probs)          # [P] in [0, ln(C)]
         scores = (1.0 - raw_entropy / np.log(n_classes)).clip(1e-7, 1.0)  # [P] in (0, 1]
@@ -125,14 +178,23 @@ def compute_patch_pooling_weights(
         weights /= weights.sum()
         return weights
 
-    if weight_method == "combined":
-        w_logit        = compute_patch_pooling_weights(patch_probs, true_label, temperature, "logit",        gamma)
-        w_entropy_logit = compute_patch_pooling_weights(patch_probs, true_label, temperature, "entropy_logit", gamma)
-        combined = (w_logit + w_entropy_logit) / 2.0
-        combined /= combined.sum()
-        return combined
+    if weight_method == "kl_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='kl_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64).clip(1e-9, 1.0)        # [P, n_classes]
+        kl = (q * np.log(q / prior[None, :])).sum(axis=1)         # [P] KL(Q_i || P_prior)
+        max_kl = -np.log(prior.min())                              # theoretical maximum
+        scores = (kl / max_kl).clip(1e-7, 1.0)                    # [P] in (0, 1]
+        logits = np.log(scores)                                    # [P] in (-inf, 0]
+        logits_scaled = logits / temperature
+        logits_scaled -= logits_scaled.max()                       # numerical stability
+        weights = np.exp(logits_scaled)
+        weights /= weights.sum()
+        return weights.astype(np.float32)
 
-    # --- default: logit method ---
+    # --- default: correct_class_prob method ---
     true_class_probs = patch_probs[:, true_label].clip(1e-7, 1.0 - 1e-7)  # [P]
     logits = np.log(true_class_probs)
     logits_scaled = logits / temperature
@@ -143,12 +205,12 @@ def compute_patch_pooling_weights(
 
 
 def compute_patch_quality_logits(
-    patch_probs:   np.ndarray,   # [P, n_classes]
+    patch_probs:   np.ndarray,             # [P, n_classes]
     true_label:    int,
     temperature:   float = 1.0,
-    weight_method: str   = "logit",
-    gamma:         float = 1.0,
-) -> np.ndarray:                 # [P]  pre-normalization scaled logits
+    weight_method: str   = "correct_class_prob",
+    class_prior:   Optional[np.ndarray] = None,  # [n_classes]  empirical class frequencies
+) -> np.ndarray:                           # [P]  pre-normalization scaled logits
     """Return the pre-normalization score for each patch, matching the
     intermediate value computed inside compute_patch_pooling_weights.
 
@@ -158,36 +220,29 @@ def compute_patch_quality_logits(
 
     Method correspondence
     ---------------------
-    ``"logit"``        → log(p_true) / temperature        (pre-stability-shift logit)
-    ``"prob"``         → gamma * log(p_true)              (log of unnormalised weight)
-    ``"entropy"``      → gamma * log(ln(C) - H)           (log of unnormalised score)
-    ``"entropy_logit"``→ log(1 - H/ln(C)) / temperature  (pre-stability-shift logit)
-    ``"combined"``     → arithmetic mean of logit + entropy_logit targets
+    ``"correct_class_prob"`` → log(p_true) / temperature
+    ``"entropy"``            → log(1 - H/ln(C)) / temperature
+    ``"kl_div"``             → log(KL(Q||P_prior) / max_KL) / temperature
+                               Requires *class_prior* [n_classes].
     """
-    if weight_method == "prob":
-        p = patch_probs[:, true_label].clip(1e-7, 1.0)
-        return (gamma * np.log(p)).astype(np.float32)
-
     if weight_method == "entropy":
-        n_classes = patch_probs.shape[1]
-        raw_entropy = compute_patch_entropy(patch_probs)               # [P]
-        scores = (np.log(n_classes) - raw_entropy).clip(1e-9)          # [P]
-        return (gamma * np.log(scores)).astype(np.float32)
-
-    if weight_method == "entropy_logit":
         n_classes = patch_probs.shape[1]
         raw_entropy = compute_patch_entropy(patch_probs)               # [P]
         scores = (1.0 - raw_entropy / np.log(n_classes)).clip(1e-7, 1.0)
         return (np.log(scores) / temperature).astype(np.float32)
 
-    if weight_method == "combined":
-        l_logit         = compute_patch_quality_logits(
-            patch_probs, true_label, temperature, "logit",         gamma)
-        l_entropy_logit = compute_patch_quality_logits(
-            patch_probs, true_label, temperature, "entropy_logit", gamma)
-        return ((l_logit + l_entropy_logit) / 2.0).astype(np.float32)
+    if weight_method == "kl_div":
+        if class_prior is None:
+            raise ValueError("class_prior must be provided for weight_method='kl_div'")
+        prior = np.asarray(class_prior, dtype=np.float64).clip(1e-9, 1.0)
+        prior /= prior.sum()
+        q = patch_probs.astype(np.float64).clip(1e-9, 1.0)
+        kl = (q * np.log(q / prior[None, :])).sum(axis=1)             # [P]
+        max_kl = -np.log(prior.min())
+        scores = (kl / max_kl).clip(1e-7, 1.0)
+        return (np.log(scores) / temperature).astype(np.float32)
 
-    # --- default: logit method ---
+    # --- default: correct_class_prob method ---
     p = patch_probs[:, true_label].clip(1e-7, 1.0 - 1e-7)
     return (np.log(p) / temperature).astype(np.float32)
 
@@ -325,8 +380,7 @@ def refine_dataset_features(
     temperature:        float = 1.0,
     seed:               int   = 42,
     batch_size:         int   = 100,
-    weight_method:      str   = "logit",
-    gamma:              float = 1.0,
+    weight_method:      str   = "correct_class_prob",
     mix_lambda:         float = 1.0,
     ridge_alpha:        float = 1.0,
     normalize_features: bool  = False,
@@ -334,7 +388,9 @@ def refine_dataset_features(
     use_random_subsampling: bool               = False,
     aoe_mask:              Optional[np.ndarray] = None,  # [N] bool; True = absence-of-evidence class
     aoe_handling:          str                 = "filter",  # "filter" | "entropy"
-) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Ridge, Optional[StandardScaler], TabICLClassifier]:
+    use_gpu_ridge:         bool                = False,   # solve Ridge normal equations on GPU
+    gpu_ridge_device:      str                 = "cuda",  # torch device for RidgeGPU
+) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
     A TabICL classifier fitted on the *input* support is used solely to generate
@@ -350,7 +406,7 @@ def refine_dataset_features(
 
     ``"entropy"``
         AoE-class images are included, but their per-patch quality logits are
-        computed with the ``"entropy_logit"`` method regardless of *weight_method*.
+        computed with the ``"entropy"`` method regardless of *weight_method*.
         This lets the Ridge model learn AoE-patch quality without relying on labels.
 
     In both cases, AoE-class images are still included in the Ridge-based support
@@ -383,12 +439,35 @@ def refine_dataset_features(
     ridge_model : Ridge
     feature_scaler : StandardScaler or None
     clf : TabICLClassifier  (scorer fitted on the *input* support_features)
+    fit_time_s : float  — seconds from start of function until Ridge.fit() completes
+                          (TabICL forward pass + Ridge fitting; the "learning" phase)
+    pool_time_s : float — seconds from after Ridge.fit() until return
+                          (Ridge prediction over all images + repooling + PCA refit;
+                          scales with N×P' and is the dominant cost for group_size=1)
+
+    Notes
+    -----
+    When *use_gpu_ridge* is ``True``, a :class:`RidgeGPU` is used instead of
+    sklearn ``Ridge``.  It solves the same normal equations on the GPU, so results
+    should be numerically equivalent.  The biggest speedup is in the pooling phase
+    (step 5), where Ridge has to predict logits for the full ``[N×P', D]`` matrix;
+    for ``group_size=1`` (P'=196) this is the bottleneck that the GPU eliminates.
+    Requires PyTorch with a working CUDA installation.
     """
+    t_start = time.perf_counter()
     N, P, D = train_patches.shape
+
+    # Precompute empirical class prior (used by kl_div weight method).
+    if weight_method == "kl_div":
+        n_cls_local = int(train_labels.max()) + 1
+        counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
+        class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)
+    else:
+        class_prior = None
 
     # Determine which images contribute to Ridge fitting and their per-image method.
     # "filter": only non-AoE images; all use weight_method.
-    # "entropy": all images; AoE images use "entropy_logit" instead of weight_method.
+    # "entropy": all images; AoE images use "entropy" instead of weight_method.
     if aoe_mask is not None and aoe_handling == "filter":
         active_indices = np.where(~aoe_mask)[0]
     else:
@@ -406,7 +485,7 @@ def refine_dataset_features(
 
     def _eff_method(local_idx: int) -> str:
         if active_is_aoe is not None and active_is_aoe[local_idx]:
-            return "entropy_logit"
+            return "entropy"
         return weight_method
 
     # Fit one shared classifier (support set is fixed for all queries this stage)
@@ -452,7 +531,7 @@ def refine_dataset_features(
                 continue
             all_targets[start:end] = compute_patch_quality_logits(
                 probs_flat[start:end], int(active_labels[idx]),
-                temperature, _eff_method(idx), gamma,
+                temperature, _eff_method(idx), class_prior,
             )
 
     else:
@@ -487,12 +566,12 @@ def refine_dataset_features(
             probs = clf.predict_proba(query_features).reshape(B_a, P, -1)   # [B_a, P, n_classes]
 
             for j in range(B_a):
-                eff = ("entropy_logit"
+                eff = ("entropy"
                        if batch_is_aoe is not None and batch_is_aoe[j]
                        else weight_method)
                 all_features[row_ptr * P:(row_ptr + 1) * P] = batch_patches_arr[j]
                 all_targets [row_ptr * P:(row_ptr + 1) * P] = compute_patch_quality_logits(
-                    probs[j], int(batch_labels_arr[j]), temperature, eff, gamma,
+                    probs[j], int(batch_labels_arr[j]), temperature, eff, class_prior,
                 )
                 row_ptr += 1
 
@@ -503,11 +582,21 @@ def refine_dataset_features(
         feature_scaler = StandardScaler()
         all_features = feature_scaler.fit_transform(all_features)
 
+    backend = "GPU" if use_gpu_ridge else "CPU"
     print(f"[ridge] Fitting Ridge(alpha={ridge_alpha}) on {len(all_features):,} patch samples "
-          f"(D={D}, method={weight_method}) ...")
-    ridge_model = Ridge(alpha=ridge_alpha)
+          f"(D={D}, method={weight_method}, backend={backend}) ...")
+    if use_gpu_ridge:
+        ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=ridge_alpha, device=gpu_ridge_device)
+    else:
+        ridge_model = Ridge(alpha=ridge_alpha)
     ridge_model.fit(all_features, all_targets)
     print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
+
+    # Split: everything up to here is the "learning" phase (TabICL forward + Ridge fit).
+    # Everything below is the "pooling" phase (Ridge predict + repooling + PCA refit),
+    # which scales with N×P' and is the dominant cost difference between group sizes.
+    t_fit_done = time.perf_counter()
+    fit_time_s = t_fit_done - t_start
 
     # --- Pool all training images with Ridge weights (always full images) ---
     print("[ridge] Pooling support set with Ridge-predicted weights ...")
@@ -516,4 +605,8 @@ def refine_dataset_features(
 
     mixed, new_pca = _mix_and_project(repooled_raw, train_patches, mix_lambda, pca, seed)
 
-    return mixed, new_pca, weights_ridge, ridge_model, feature_scaler, clf
+    pool_time_s = time.perf_counter() - t_fit_done
+    print(f"[timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
+          f"total={fit_time_s + pool_time_s:.1f}s")
+
+    return mixed, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s
