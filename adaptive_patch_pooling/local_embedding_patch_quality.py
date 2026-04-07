@@ -533,11 +533,11 @@ def run_patch_quality_eval(
     open_image: Optional[Callable] = None
     if cfg.dataset.n_sample > 0:
         if cfg.dataset.dataset == "butterfly":
-            train_image_paths, _, idx_to_class = _get_image_paths(dataset_path, split="train", seed=cfg.seed)
-            test_image_paths,  _, _            = _get_image_paths(dataset_path, split="test",  seed=cfg.seed)
+            train_image_paths, _, idx_to_class = _get_image_paths(cfg.dataset.dataset_path, split="train", seed=cfg.seed)
+            test_image_paths,  _, _            = _get_image_paths(cfg.dataset.dataset_path, split="test",  seed=cfg.seed)
         elif cfg.dataset.dataset == "rsna":
-            train_image_paths, _, _ = _get_rsna_image_paths(dataset_path, cfg.dataset.features_dir, split="train", backbone=cfg.dataset.backbone)
-            test_image_paths,  _, _ = _get_rsna_image_paths(dataset_path, cfg.dataset.features_dir, split="test",  backbone=cfg.dataset.backbone)
+            train_image_paths, _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="train", backbone=cfg.dataset.backbone)
+            test_image_paths,  _, _ = _get_rsna_image_paths(cfg.dataset.dataset_path, cfg.dataset.features_dir, split="test",  backbone=cfg.dataset.backbone)
             open_image = _dicom_to_pil
 
         # Keep train_image_paths aligned with train_patches by applying the same
@@ -671,141 +671,116 @@ def run_patch_quality_eval(
     # how training embeddings were constructed).
     # ---------------------------------------------------------------------------
 
-    #pal_pooler = pooler_factory(cfg.tabicl, cfg.refinement)
-    #pal_pooler.fit(baseline_support, train_labels)
-
-    
-
-    tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
-    pal_pooler = IterativePALPooler(tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed)
-
-    pal_pooler.fit(train_patches, train_labels)
-
-    print("FINISHED :)")
-
-    ### OLD CODE STARTS HERE ###
-
-    """
-    current_support = baseline_support
-    current_pca     = pca
     all_results: list[tuple[str, float, float, dict, float, float]] = [
         ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)
     ]
 
-    for stage_idx, group_size in enumerate(cfg.refinement.patch_group_sizes):
+    # State saved by the callback so the post-loop final-viz block can use it.
+    _last_stage_data: dict = {}
 
-        iteration_k_refinement_cfg = copy.deepcopy(cfg.refinement)
-        iteration_k_refinement_cfg.patch_group_sizes = group_size
-        iteration_k_refinement_cfg.temperature = temperatures[stage_idx]
-        iteration_k_refinement_cfg.ridge_alpha = ridge_alphas[stage_idx]
-
+    def _stage_callback(stage_idx, stage, group_size, pre_refine_support, pre_refine_pca, train_grouped):
+        """Per-stage hook: visualise, evaluate accuracy, and record results."""
         group_side   = int(round(group_size ** 0.5))
         eff_patch_sz = cfg.refinement.patch_size * group_side
         tag          = f"iter_{stage_idx}_g{group_size}"
 
-        print(f"\n[{tag}] group_size={group_size}  ({group_side}×{group_side} patches per group)  "
-              f"T={iteration_k_refinement_cfg.temperature}  ridge_alpha={iteration_k_refinement_cfg.ridge_alpha}")
+        test_grouped = group_patches(test_patches, group_size)  # [N_test, P', D]
 
-        train_grouped = group_patches(train_patches, group_size)   # [N, P', D]
-        test_grouped  = group_patches(test_patches,  group_size)   # [N_test, P', D]
-        P_grouped     = train_grouped.shape[1]
+        ridge_model    = stage.ridge_model_
+        feature_scaler = stage.feature_scaler_
+        fit_time_s     = stage.fit_time_s_
+        pool_time_s    = stage.pool_time_s_
+        new_support    = stage._support_projected_
+        new_pca        = stage._pca_
 
         # -- Visualise patch quality under the *input* support (before refinement) --
-        # This matches exactly what will drive the pooling weights this stage.
         if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz:
             split_configs_iter = [
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
             iter_mean_probs = _run_visual_eval(
-                tag, current_support, train_labels, split_configs_iter, idx_to_class,
-                pca=current_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
+                tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
+                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
                 seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=iteration_k_refinement_cfg.temperature,
+                temperature=stage.refinement_cfg.temperature,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             )
         else:
             iter_mean_probs = {}
 
-        # -- Refine support (clf fitted on current_support internally) --
-        # Save pre-refinement state so the final post-all-refinement viz can use it.
-        pre_refine_support = current_support
-        pre_refine_pca     = current_pca
-        print(f"[{tag}] Refining support "
-              f"(method={cfg.refinement.weight_method}, T={iteration_k_refinement_cfg.temperature}) ...")
-        new_support, new_pca, _weights, ridge_model, feature_scaler, scoring_clf, \
-            fit_time_s, pool_time_s = \
-            refine_dataset_features(
-                train_grouped, train_labels, current_support, 
-                refinement_cfg = iteration_k_refinement_cfg, pca = current_pca, 
-                seed=cfg.seed, aoe_mask=aoe_mask,
-                gpu_ridge_device="cuda" if cfg.attention.device == "auto" else cfg.attention.device,
-            )
-        refine_time_s = fit_time_s + pool_time_s
-
-        if ridge_model is not None:
-            ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
-            joblib.dump(ridge_model, ridge_path)
-            print(f"[ridge] Model saved → {ridge_path}")
+        # -- Save Ridge model to disk --
+        ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
+        joblib.dump(ridge_model, ridge_path)
+        print(f"[ridge] Model saved → {ridge_path}")
 
         # -- Post-refinement visualisation with Ridge pooling weights --
-        if cfg.dataset.n_sample > 0 and cfg.run.post_refinement_viz and ridge_model is not None:
+        if cfg.dataset.n_sample > 0 and cfg.run.post_refinement_viz:
             split_configs_post = [
                 ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
                 ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
             ]
             iter_mean_probs = _run_visual_eval(
-                f"{tag}_post", current_support, train_labels, split_configs_post, idx_to_class,
-                pca=current_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
+                f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
+                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
                 seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=iteration_k_refinement_cfg.temperature,
+                temperature=stage.refinement_cfg.temperature,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             )
 
-        # -- Pool test queries with Ridge (full images, same model as training) --
+        # -- Pool test queries with Ridge and evaluate accuracy --
         w_ridge       = _ridge_pool_weights(test_grouped, ridge_model, feature_scaler)
-        test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)   # [N_test, D]
-
-        test_query = (
+        test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)  # [N_test, D]
+        test_query    = (
             new_pca.transform(test_repooled).astype(np.float32)
             if new_pca is not None else test_repooled
         )
 
-        # -- Evaluate accuracy with quality-pooled test queries --
         t_eval_start = time.perf_counter()
         iter_acc, iter_auroc = _compute_accuracy_from_features(
             new_support, train_labels, test_query, test_labels,
             n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
         )
         eval_time_s = time.perf_counter() - t_eval_start
+        refine_time_s = fit_time_s + pool_time_s
         print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
               f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
 
         all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
-        current_support = new_support
-        current_pca     = new_pca
-    """
 
-    ### OLD CODE ENDS HERE ###
+        # Persist data needed by the post-loop final-viz block.
+        _last_stage_data.update(
+            tag=tag, eff_patch_sz=eff_patch_sz,
+            train_grouped=train_grouped, test_grouped=test_grouped,
+            ridge_model=ridge_model, feature_scaler=feature_scaler,
+            pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
+            temperature=stage.refinement_cfg.temperature,
+        )
+
+    tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
+    pal_pooler = IterativePALPooler(tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed)
+    pal_pooler.fit(train_patches, train_labels, stage_callback=_stage_callback)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
     # heatmaps even when per-stage post-refinement viz was skipped.
 
-    if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and cfg.refinement.refine and ridge_model is not None:
+    if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and cfg.refinement.refine and _last_stage_data:
         split_configs_final = [
-            ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
-            ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
+            ("train", _last_stage_data["train_grouped"], train_labels, train_image_paths, train_sample_idx),
+            ("test",  _last_stage_data["test_grouped"],  test_labels,  test_image_paths,  test_sample_idx),
         ]
         _run_visual_eval(
-            f"{tag}_post", pre_refine_support, train_labels, split_configs_final, idx_to_class,
-            pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
+            f"{_last_stage_data['tag']}_post", _last_stage_data["pre_refine_support"], train_labels,
+            split_configs_final, idx_to_class,
+            pca=_last_stage_data["pre_refine_pca"], n_estimators=cfg.refinement.tabicl_n_estimators,
+            patch_size=_last_stage_data["eff_patch_sz"],
             seed=cfg.seed, output_dir=cfg.run.output_dir,
-            temperature=iteration_k_refinement_cfg.temperature,
-            ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
-            class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            temperature=_last_stage_data["temperature"],
+            ridge_model=_last_stage_data["ridge_model"], feature_scaler=_last_stage_data["feature_scaler"],
+            open_image=open_image, class_prior=class_prior, weight_method=cfg.refinement.weight_method,
         )
 
     total_time_s = time.perf_counter() - experiment_start

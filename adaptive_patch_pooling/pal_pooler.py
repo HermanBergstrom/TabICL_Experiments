@@ -558,6 +558,7 @@ class IterativePALPooler:
         self,
         patches: np.ndarray,
         labels: np.ndarray,
+        stage_callback=None,
     ) -> "IterativePALPooler":
         """Fit all stages sequentially, passing the refined support forward.
 
@@ -567,6 +568,22 @@ class IterativePALPooler:
             Raw patch embeddings for the training set.
         labels : np.ndarray, shape [N]
             Integer class labels.
+        stage_callback : callable or None
+            Optional hook called after each stage is fitted.  Signature::
+
+                stage_callback(
+                    stage_idx: int,
+                    stage: PALPooler,
+                    group_size: int,
+                    pre_refine_support: np.ndarray,
+                    pre_refine_pca: Optional[PCA],
+                    train_grouped: np.ndarray,
+                )
+
+            ``pre_refine_support`` / ``pre_refine_pca`` are the support and PCA
+            *before* this stage's refinement (i.e. the input to the stage).
+            ``train_grouped`` is the spatially-grouped training patch tensor
+            ``[N, P', D]`` used internally by this stage.
 
         Returns
         -------
@@ -580,21 +597,41 @@ class IterativePALPooler:
         alphas = self._expand_param(self.refinement_cfg.ridge_alpha, n_stages, "ridge_alpha")
 
         stages: List[PALPooler] = []
-        initial_support: Optional[np.ndarray] = None
-        initial_pca: Optional[PCA] = None
+
+        # Build the mean-pool baseline support up front so that stage 0's callback
+        # receives it as pre_refine_support rather than None.
+        patches = np.asarray(patches, dtype=np.float32)
+        N, _P, D = patches.shape
+        support_raw = patches.mean(axis=1)  # [N, D]
+        if self.pca_dim is not None:
+            n_comp = min(self.pca_dim, N, D)
+            initial_pca: Optional[PCA] = PCA(n_components=n_comp, random_state=self.seed)
+            initial_support: Optional[np.ndarray] = initial_pca.fit_transform(support_raw).astype(np.float32)
+        else:
+            initial_pca = None
+            initial_support = support_raw
 
         print("Patch shape", patches.shape)
 
         for k, group_size in enumerate(self.patch_group_sizes):
+            from adaptive_patch_pooling.patch_pooling import group_patches
+
             print(f"[IterativePALPooler] Stage {k}/{n_stages - 1} "
                   f"— patch_group_size={group_size}, "
                   f"temperature={temps[k]}, ridge_alpha={alphas[k]}")
-            
 
             iteration_k_refinement_cfg = copy.deepcopy(self.refinement_cfg)
             iteration_k_refinement_cfg.patch_group_sizes = group_size
             iteration_k_refinement_cfg.temperature = temps[k]
             iteration_k_refinement_cfg.ridge_alpha = alphas[k]
+
+            # Snapshot support/PCA before refinement for the callback.
+            pre_refine_support = initial_support
+            pre_refine_pca = initial_pca
+
+            # Compute grouped patches here so the callback receives them without
+            # requiring a second call inside PALPooler (minor duplication accepted).
+            train_grouped = group_patches(patches, group_size)  # [N, P', D]
 
             stage = PALPooler(
                 tabicl=self.tabicl,
@@ -604,6 +641,16 @@ class IterativePALPooler:
             )
             stage.fit(patches, labels, initial_support=initial_support, initial_pca=initial_pca)
             stages.append(stage)
+
+            if stage_callback is not None:
+                stage_callback(
+                    stage_idx=k,
+                    stage=stage,
+                    group_size=group_size,
+                    pre_refine_support=pre_refine_support,
+                    pre_refine_pca=pre_refine_pca,
+                    train_grouped=train_grouped,
+                )
 
             # Hand the internal projected support to the next stage.
             initial_support = stage._support_projected_
