@@ -13,6 +13,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
+from adaptive_patch_pooling.config import RefinementConfig, TabICLConfig
 from tabicl import TabICLClassifier
 from tqdm import tqdm
 
@@ -348,20 +349,23 @@ def refine_dataset_features(
     train_patches:      np.ndarray,      # [N, P, D]  raw DINO patch features
     train_labels:       np.ndarray,      # [N]
     support_features:   np.ndarray,      # [N, d]  initial mean-pooled (post-PCA) features
+    tabicl_cfg: TabICLConfig,
+    refinement_cfg: RefinementConfig,
     pca:                Optional[PCA],   # PCA fitted on the baseline support set
-    n_estimators:       int   = 1,
+    #n_estimators:       int   = 1,
     temperature:        float = 1.0,
     seed:               int   = 42,
-    batch_size:         int   = 100,
-    weight_method:      str   = "correct_class_prob",
+    #batch_size:         int   = 100,
+    #weight_method:      str   = "correct_class_prob",
     ridge_alpha:        float = 1.0,
-    normalize_features: bool  = False,
-    max_query_rows:        Optional[int]       = None,
-    use_random_subsampling: bool               = False,
+    #normalize_features: bool  = False,
+    #max_query_rows:        Optional[int]       = None,
+    #use_random_subsampling: bool               = False,
     aoe_mask:              Optional[np.ndarray] = None,  # [N] bool; True = absence-of-evidence class
-    aoe_handling:          str                 = "filter",  # "filter" | "entropy"
-    use_gpu_ridge:         bool                = False,   # solve Ridge normal equations on GPU
-    gpu_ridge_device:      str                 = "cuda",  # torch device for RidgeGPU
+    #aoe_handling:          str                 = "filter",  # "filter" | "entropy"
+    #use_gpu_ridge:         bool                = False,   # solve Ridge normal equations on GPU
+    #gpu_ridge_device:      str                 = "cuda",  # torch device for RidgeGPU
+    gpu_ridge_device:      str                 = "cuda",
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -430,7 +434,7 @@ def refine_dataset_features(
     N, P, D = train_patches.shape
 
     # Precompute empirical class prior (used by kl_div weight method).
-    if weight_method == "kl_div":
+    if refinement_cfg.weight_method == "kl_div":
         n_cls_local = int(train_labels.max()) + 1
         counts = np.bincount(train_labels.astype(np.int64), minlength=n_cls_local)
         class_prior: Optional[np.ndarray] = (counts / counts.sum()).astype(np.float32)
@@ -440,7 +444,7 @@ def refine_dataset_features(
     # Determine which images contribute to Ridge fitting and their per-image method.
     # "filter": only non-AoE images; all use weight_method.
     # "entropy": all images; AoE images use "entropy" instead of weight_method.
-    if aoe_mask is not None and aoe_handling == "filter":
+    if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
         active_indices = np.where(~aoe_mask)[0]
     else:
         active_indices = np.arange(N)
@@ -450,7 +454,7 @@ def refine_dataset_features(
     active_total_rows = N_active * P
 
     # Per-image effective weight method (None = all images use weight_method)
-    if aoe_mask is not None and aoe_handling == "entropy":
+    if aoe_mask is not None and refinement_cfg.aoe_handling == "entropy":
         active_is_aoe = aoe_mask[active_indices]   # [N_active] bool
     else:
         active_is_aoe = None
@@ -458,24 +462,24 @@ def refine_dataset_features(
     def _eff_method(local_idx: int) -> str:
         if active_is_aoe is not None and active_is_aoe[local_idx]:
             return "entropy"
-        return weight_method
+        return refinement_cfg.weight_method
 
     # Fit one shared classifier (support set is fixed for all queries this stage)
-    clf = TabICLClassifier(n_estimators=n_estimators, random_state=seed)
+    clf = TabICLClassifier(n_estimators=tabicl_cfg.n_estimators, random_state=seed)
     clf.fit(support_features, train_labels)
 
     # Decide forward-pass strategy:
     #   one_pass=True  → forward a contiguous block of rows in a single predict_proba call
     #                    (either all active rows, or a random subset when subsampling)
     #   one_pass=False → forward in batches of batch_size images (fallback / default)
-    exceeded = max_query_rows is not None and active_total_rows > max_query_rows
-    one_pass = max_query_rows is not None and (not exceeded or use_random_subsampling)
+    exceeded = refinement_cfg.max_query_rows is not None and active_total_rows > refinement_cfg.max_query_rows
+    one_pass = refinement_cfg.max_query_rows is not None and (not exceeded or refinement_cfg.use_random_subsampling)
 
     if one_pass:
         if exceeded:
             # Subsampled: draw max_query_rows (image, patch) pairs from active images
-            n_fwd    = max_query_rows
-            aoe_note = f" (aoe_handling={aoe_handling})" if aoe_mask is not None else ""
+            n_fwd    = refinement_cfg.max_query_rows
+            aoe_note = f" (aoe_handling={refinement_cfg.aoe_handling})" if aoe_mask is not None else ""
             print(f"[sampling] Subsampling {n_fwd:,} / {active_total_rows:,} patch-group rows "
                   f"({100 * n_fwd / active_total_rows:.1f}%) for Ridge fitting{aoe_note}")
             rng           = np.random.RandomState(seed)
@@ -513,12 +517,12 @@ def refine_dataset_features(
         all_targets  = np.empty(active_total_rows,      dtype=np.float32)
         row_ptr      = 0
 
-        for batch_start in tqdm(range(0, N, batch_size),
+        for batch_start in tqdm(range(0, N, refinement_cfg.batch_size),
                                 desc="Computing patch quality scores", unit="batch"):
-            batch_end = min(batch_start + batch_size, N)
+            batch_end = min(batch_start + refinement_cfg.batch_size, N)
             # For "filter" mode, exclude AoE images from the batch.
             # For "entropy" mode (and no AoE), include all images.
-            if aoe_mask is not None and aoe_handling == "filter":
+            if aoe_mask is not None and refinement_cfg.aoe_handling == "filter":
                 active_in_batch = [j for j in range(batch_start, batch_end) if not aoe_mask[j]]
                 if not active_in_batch:
                     continue
@@ -540,24 +544,24 @@ def refine_dataset_features(
             for j in range(B_a):
                 eff = ("entropy"
                        if batch_is_aoe is not None and batch_is_aoe[j]
-                       else weight_method)
+                       else refinement_cfg.weight_method)
                 all_features[row_ptr * P:(row_ptr + 1) * P] = batch_patches_arr[j]
                 all_targets [row_ptr * P:(row_ptr + 1) * P] = compute_patch_quality_logits(
-                    probs[j], int(batch_labels_arr[j]), temperature, eff, class_prior,
+                    probs[j], int(batch_labels_arr[j]), refinement_cfg.temperature, eff, class_prior,
                 )
                 row_ptr += 1
 
     # --- Fit Ridge on collected (patch_feature, quality_logit) pairs ---
     feature_scaler: Optional[StandardScaler] = None
-    if normalize_features:
+    if refinement_cfg.normalize_features:
         print("[ridge] Fitting StandardScaler on training patches ...")
         feature_scaler = StandardScaler()
         all_features = feature_scaler.fit_transform(all_features)
 
-    backend = "GPU" if use_gpu_ridge else "CPU"
+    backend = "GPU" if gpu_ridge_device else "CPU"
     print(f"[ridge] Fitting Ridge(alpha={ridge_alpha}) on {len(all_features):,} patch samples "
-          f"(D={D}, method={weight_method}, backend={backend}) ...")
-    if use_gpu_ridge:
+          f"(D={D}, method={refinement_cfg.weight_method}, backend={backend}) ...")
+    if gpu_ridge_device:
         ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=ridge_alpha, device=gpu_ridge_device)
     else:
         ridge_model = Ridge(alpha=ridge_alpha)
