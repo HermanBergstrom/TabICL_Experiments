@@ -43,7 +43,7 @@ from adaptive_patch_pooling.patch_pooling import (
     refine_dataset_features,
 )
 from adaptive_patch_pooling.patch_visualisation import summary_figure, visualise_image
-from adaptive_patch_pooling.config import DatasetConfig, TabICLConfig, RefinementConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
+from adaptive_patch_pooling.config import DatasetConfig, RefinementConfig, AttentionPoolConfig, RunConfig, ExperimentConfig, parse_args
 from adaptive_patch_pooling.data_loading import (
     _get_image_paths,
     _dicom_to_pil,
@@ -51,6 +51,8 @@ from adaptive_patch_pooling.data_loading import (
     _load_features,
     _balance_classes,
 )
+
+from adaptive_patch_pooling.pal_pooler import IterativePALPooler, pooler_factory
 
 # ---------------------------------------------------------------------------
 # Accuracy helpers
@@ -294,9 +296,7 @@ def _run_attn_only(
     D:                    int,
     output_dir:           Path,
     attn_cfg:             AttentionPoolConfig,
-    tabicl_cfg:           TabICLConfig,
     seed:                 int,
-    cfg:                  ExperimentConfig,
 ) -> None:
     """Train the attention pooling head and save results to attn_pool_results.json.
 
@@ -347,17 +347,17 @@ def _run_attn_only(
     best_val_step    = attn_history.get("best_val_step", 0)
 
     # Post-hoc evaluation: pool with best checkpoint → PCA (if used) → TabICLClassifier
-    print(f"[attn-pool]  Evaluating best checkpoint (step {best_val_step}) with PCA={tabicl_cfg.pca_dim} ...")
+    print(f"[attn-pool]  Evaluating best checkpoint (step {best_val_step}) with PCA={attn_cfg.tabicl_pca_dim} ...")
     train_pooled = _pool_with_head(head, _torch.from_numpy(train_patches), _device)
     test_pooled  = _pool_with_head(head, _torch.from_numpy(test_patches),  _device)
-    if tabicl_cfg.pca_dim is not None:
-        n_comp_attn = min(tabicl_cfg.pca_dim, len(train_labels), train_pooled.shape[1])
+    if attn_cfg.tabicl_pca_dim is not None:
+        n_comp_attn = min(attn_cfg.tabicl_pca_dim, len(train_labels), train_pooled.shape[1])
         attn_pca    = PCA(n_components=n_comp_attn, random_state=seed)
         train_pooled = attn_pca.fit_transform(train_pooled).astype(np.float32)
         test_pooled  = attn_pca.transform(test_pooled).astype(np.float32)
     test_acc, test_auroc = _compute_accuracy_from_features(
         train_pooled, train_labels, test_pooled, test_labels,
-        n_estimators=tabicl_cfg.n_estimators, seed=seed,
+        n_estimators=attn_cfg.tabicl_n_estimators, seed=seed,
     )
 
     attn_result = {
@@ -368,7 +368,7 @@ def _run_attn_only(
         "time_to_best_s":     time_to_best_s,
         "total_train_time_s": round(total_time_s, 2),
     }
-    print(f"[attn-pool]  test acc (PCA={tabicl_cfg.pca_dim}): {test_acc:.4f}  auroc: {test_auroc:.4f}  "
+    print(f"[attn-pool]  test acc (PCA={attn_cfg.tabicl_pca_dim}): {test_acc:.4f}  auroc: {test_auroc:.4f}  "
           f"(best train val: {best_val_acc_raw:.4f}  "
           f"step {best_val_step}/{attn_cfg.attn_steps}  time_to_best={time_to_best_s:.1f}s)")
 
@@ -469,7 +469,7 @@ def run_patch_quality_eval(
         _run_attn_only(
             train_patches=train_patches, train_labels=train_labels,
             test_patches=test_patches,   test_labels=test_labels,
-            D=D, output_dir=output_dir, attn_cfg=cfg.attention, tabicl_cfg=cfg.tabicl,
+            D=D, output_dir=output_dir, attn_cfg=cfg.attention,
             seed=cfg.seed, cfg=cfg,
         )
         _merge_attn_into_results(output_dir)
@@ -501,8 +501,8 @@ def run_patch_quality_eval(
     # Cast to float32 before mean to avoid float16 accumulation errors.
     baseline_support_raw = train_patches.astype(np.float32).mean(axis=1)   # [N_train, D]
     pca: Optional[PCA] = None
-    if cfg.tabicl.pca_dim is not None:
-        n_comp = min(cfg.tabicl.pca_dim, N_train, D)
+    if cfg.refinement.tabicl_pca_dim is not None:
+        n_comp = min(cfg.refinement.tabicl_pca_dim, N_train, D)
         pca    = PCA(n_components=n_comp, random_state=cfg.seed)
         baseline_support = pca.fit_transform(baseline_support_raw).astype(np.float32)
         print(f"[info] PCA: {D}D → {n_comp}D")
@@ -514,8 +514,8 @@ def run_patch_quality_eval(
     cls_auroc: Optional[float] = None
     if cls_train_feats is not None and cls_test_feats is not None:
         cls_pca: Optional[PCA] = None
-        if cfg.tabicl.pca_dim is not None:
-            n_comp_cls  = min(cfg.tabicl.pca_dim, len(cls_train_feats), cls_train_feats.shape[1])
+        if cfg.refinement.tabicl_pca_dim is not None:
+            n_comp_cls  = min(cfg.refinement.tabicl_pca_dim, len(cls_train_feats), cls_train_feats.shape[1])
             cls_pca     = PCA(n_components=n_comp_cls, random_state=cfg.seed)
             cls_support = cls_pca.fit_transform(cls_train_feats).astype(np.float32)
             cls_test_q  = cls_pca.transform(cls_test_feats).astype(np.float32)
@@ -524,7 +524,7 @@ def run_patch_quality_eval(
             cls_test_q  = cls_test_feats
         cls_acc, cls_auroc = _compute_accuracy_from_features(
             cls_support, train_labels, cls_test_q, test_labels,
-            n_estimators=cfg.tabicl.n_estimators, seed=cfg.seed,
+            n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
         )
 
     # --- Image paths + opener for visualisation (only loaded when needed) ---
@@ -554,7 +554,7 @@ def run_patch_quality_eval(
     # --- Baseline: accuracy + visual eval at original patch resolution ---
     baseline_acc, baseline_auroc = _compute_accuracy(
         baseline_support, train_labels, test_patches, test_labels,
-        pca=pca, n_estimators=cfg.tabicl.n_estimators, seed=cfg.seed,
+        pca=pca, n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
     )
     if cls_acc is not None:
         print(f"\n[cls-token]  test accuracy: {cls_acc:.4f}  auroc: {cls_auroc:.4f}")
@@ -606,17 +606,17 @@ def run_patch_quality_eval(
 
         # Post-hoc evaluation: pool with best checkpoint → PCA → TabICLClassifier
         from attention_pooling_experiments import _pool_with_head as _attn_pool_fn
-        print(f"[attn-pool]  Evaluating best checkpoint (step {attn_best_step}) with PCA={cfg.tabicl.pca_dim} ...")
+        print(f"[attn-pool]  Evaluating best checkpoint (step {attn_best_step}) with PCA={cfg.attention.tabicl_pca_dim} ...")
         attn_train_pooled = _attn_pool_fn(attn_head, _torch.from_numpy(train_patches), _device)
         attn_test_pooled  = _attn_pool_fn(attn_head, _torch.from_numpy(test_patches),  _device)
-        if cfg.tabicl.pca_dim is not None:
-            n_comp_attn       = min(cfg.tabicl.pca_dim, len(train_labels), attn_train_pooled.shape[1])
+        if cfg.attention.tabicl_pca_dim is not None:
+            n_comp_attn       = min(cfg.attention.tabicl_pca_dim, len(train_labels), attn_train_pooled.shape[1])
             attn_pca          = PCA(n_components=n_comp_attn, random_state=cfg.seed)
             attn_train_pooled = attn_pca.fit_transform(attn_train_pooled).astype(np.float32)
             attn_test_pooled  = attn_pca.transform(attn_test_pooled).astype(np.float32)
         attn_test_acc, attn_test_auroc = _compute_accuracy_from_features(
             attn_train_pooled, train_labels, attn_test_pooled, test_labels,
-            n_estimators=cfg.tabicl.n_estimators, seed=cfg.seed,
+            n_estimators=cfg.attention.tabicl_n_estimators, seed=cfg.seed,
         )
 
         attn_result = {
@@ -627,7 +627,7 @@ def run_patch_quality_eval(
             "time_to_best_s":     attn_time_to_best,
             "total_train_time_s": round(attn_total_time_s, 2),
         }
-        print(f"[attn-pool]  test acc (PCA={cfg.tabicl.pca_dim}): {attn_test_acc:.4f}  auroc: {attn_test_auroc:.4f}  "
+        print(f"[attn-pool]  test acc (PCA={cfg.attention.tabicl_pca_dim}): {attn_test_acc:.4f}  auroc: {attn_test_auroc:.4f}  "
               f"(best train val: {attn_best_val_acc_raw:.4f}  "
               f"step {attn_best_step}/{cfg.attention.attn_steps}  time_to_best={attn_time_to_best:.1f}s)")
 
@@ -638,7 +638,7 @@ def run_patch_quality_eval(
         ]
         baseline_mean_probs = _run_visual_eval(
             "baseline", baseline_support, train_labels, split_configs_orig, idx_to_class,
-            pca=pca, n_estimators=cfg.tabicl.n_estimators, patch_size=cfg.refinement.patch_size,
+            pca=pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=cfg.refinement.patch_size,
             seed=cfg.seed, output_dir=cfg.run.output_dir,
             temperature=temperatures[0],
             ridge_model=None, feature_scaler=None, open_image=open_image,
@@ -671,6 +671,21 @@ def run_patch_quality_eval(
     # how training embeddings were constructed).
     # ---------------------------------------------------------------------------
 
+    #pal_pooler = pooler_factory(cfg.tabicl, cfg.refinement)
+    #pal_pooler.fit(baseline_support, train_labels)
+
+    
+
+    tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
+    pal_pooler = IterativePALPooler(tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed)
+
+    pal_pooler.fit(train_patches, train_labels)
+
+    print("FINISHED :)")
+
+    ### OLD CODE STARTS HERE ###
+
+    """
     current_support = baseline_support
     current_pca     = pca
     all_results: list[tuple[str, float, float, dict, float, float]] = [
@@ -678,14 +693,18 @@ def run_patch_quality_eval(
     ]
 
     for stage_idx, group_size in enumerate(cfg.refinement.patch_group_sizes):
-        stage_temp  = temperatures[stage_idx]
-        stage_alpha = ridge_alphas[stage_idx]
+
+        iteration_k_refinement_cfg = copy.deepcopy(cfg.refinement)
+        iteration_k_refinement_cfg.patch_group_sizes = group_size
+        iteration_k_refinement_cfg.temperature = temperatures[stage_idx]
+        iteration_k_refinement_cfg.ridge_alpha = ridge_alphas[stage_idx]
+
         group_side   = int(round(group_size ** 0.5))
         eff_patch_sz = cfg.refinement.patch_size * group_side
         tag          = f"iter_{stage_idx}_g{group_size}"
 
         print(f"\n[{tag}] group_size={group_size}  ({group_side}×{group_side} patches per group)  "
-              f"T={stage_temp}  ridge_alpha={stage_alpha}")
+              f"T={iteration_k_refinement_cfg.temperature}  ridge_alpha={iteration_k_refinement_cfg.ridge_alpha}")
 
         train_grouped = group_patches(train_patches, group_size)   # [N, P', D]
         test_grouped  = group_patches(test_patches,  group_size)   # [N_test, P', D]
@@ -700,9 +719,9 @@ def run_patch_quality_eval(
             ]
             iter_mean_probs = _run_visual_eval(
                 tag, current_support, train_labels, split_configs_iter, idx_to_class,
-                pca=current_pca, n_estimators=cfg.tabicl.n_estimators, patch_size=eff_patch_sz,
+                pca=current_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
                 seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=stage_temp,
+                temperature=iteration_k_refinement_cfg.temperature,
                 ridge_model=None, feature_scaler=None, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             )
@@ -714,14 +733,13 @@ def run_patch_quality_eval(
         pre_refine_support = current_support
         pre_refine_pca     = current_pca
         print(f"[{tag}] Refining support "
-              f"(method={cfg.refinement.weight_method}, T={stage_temp}) ...")
+              f"(method={cfg.refinement.weight_method}, T={iteration_k_refinement_cfg.temperature}) ...")
         new_support, new_pca, _weights, ridge_model, feature_scaler, scoring_clf, \
             fit_time_s, pool_time_s = \
             refine_dataset_features(
                 train_grouped, train_labels, current_support, 
-                tabicl_cfg = cfg.tabicl, refinement_cfg = cfg.refinement, 
-                pca = current_pca, seed=cfg.seed, ridge_alpha=stage_alpha,
-                temperature=stage_temp, aoe_mask=aoe_mask,
+                refinement_cfg = iteration_k_refinement_cfg, pca = current_pca, 
+                seed=cfg.seed, aoe_mask=aoe_mask,
                 gpu_ridge_device="cuda" if cfg.attention.device == "auto" else cfg.attention.device,
             )
         refine_time_s = fit_time_s + pool_time_s
@@ -739,9 +757,9 @@ def run_patch_quality_eval(
             ]
             iter_mean_probs = _run_visual_eval(
                 f"{tag}_post", current_support, train_labels, split_configs_post, idx_to_class,
-                pca=current_pca, n_estimators=cfg.tabicl.n_estimators, patch_size=eff_patch_sz,
+                pca=current_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
                 seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=stage_temp,
+                temperature=iteration_k_refinement_cfg.temperature,
                 ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
                 class_prior=class_prior, weight_method=cfg.refinement.weight_method,
             )
@@ -759,7 +777,7 @@ def run_patch_quality_eval(
         t_eval_start = time.perf_counter()
         iter_acc, iter_auroc = _compute_accuracy_from_features(
             new_support, train_labels, test_query, test_labels,
-            n_estimators=cfg.tabicl.n_estimators, seed=cfg.seed,
+            n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
         )
         eval_time_s = time.perf_counter() - t_eval_start
         print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
@@ -768,10 +786,14 @@ def run_patch_quality_eval(
         all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
         current_support = new_support
         current_pca     = new_pca
+    """
+
+    ### OLD CODE ENDS HERE ###
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
     # heatmaps even when per-stage post-refinement viz was skipped.
+
     if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz and cfg.refinement.refine and ridge_model is not None:
         split_configs_final = [
             ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
@@ -779,9 +801,9 @@ def run_patch_quality_eval(
         ]
         _run_visual_eval(
             f"{tag}_post", pre_refine_support, train_labels, split_configs_final, idx_to_class,
-            pca=pre_refine_pca, n_estimators=cfg.tabicl.n_estimators, patch_size=eff_patch_sz,
+            pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
             seed=cfg.seed, output_dir=cfg.run.output_dir,
-            temperature=stage_temp,
+            temperature=iteration_k_refinement_cfg.temperature,
             ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
             class_prior=class_prior, weight_method=cfg.refinement.weight_method,
         )

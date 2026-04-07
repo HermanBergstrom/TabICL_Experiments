@@ -46,11 +46,13 @@ Two-stage chained refinement (IterativePALPooler)
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import List, Optional, Union
 
 import numpy as np
 from sklearn.decomposition import PCA
+from adaptive_patch_pooling.config import RefinementConfig
 from tabicl import TabICLClassifier
 
 from adaptive_patch_pooling.patch_pooling import (
@@ -155,36 +157,15 @@ class PALPooler:
     def __init__(
         self,
         tabicl: TabICLClassifier,
-        patch_group_size: int = 1,
-        weight_method: str = "correct_class_prob",
-        temperature: float = 1.0,
-        ridge_alpha: float = 1.0,
-        max_query_rows: Optional[int] = None,
-        use_random_subsampling: bool = False,
-        pca_dim: Optional[int] = 128,
-        batch_size: int = 1000,
+        refinement_cfg: RefinementConfig,
         seed: int = 42,
-        aoe_class: Optional[int] = None,
-        aoe_handling: str = "filter",
-        gpu_ridge: bool = False,
         gpu_ridge_device: str = "cuda",
-        normalize_features: bool = False,
     ) -> None:
         self.tabicl = tabicl
-        self.patch_group_size = patch_group_size
-        self.weight_method = weight_method
-        self.temperature = temperature
-        self.ridge_alpha = ridge_alpha
-        self.max_query_rows = max_query_rows
-        self.use_random_subsampling = use_random_subsampling
-        self.pca_dim = pca_dim
-        self.batch_size = batch_size
+        self.refinement_cfg = refinement_cfg
+        self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
-        self.aoe_class = aoe_class
-        self.aoe_handling = aoe_handling
-        self.gpu_ridge = gpu_ridge
         self.gpu_ridge_device = gpu_ridge_device
-        self.normalize_features = normalize_features
 
     # ------------------------------------------------------------------
     # Core sklearn-style API
@@ -227,7 +208,7 @@ class PALPooler:
         N, P, D = patches.shape
         self.embed_dim_ = D
 
-        grouped = group_patches(patches, self.patch_group_size)  # [N, P', D]
+        grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)  # [N, P', D]
         self.n_patches_grouped_ = grouped.shape[1]
 
         if initial_support is not None:
@@ -244,10 +225,8 @@ class PALPooler:
                 support = support_raw
 
         aoe_mask: Optional[np.ndarray] = None
-        if self.aoe_class is not None:
-            aoe_mask = (labels == self.aoe_class)
-
-        n_estimators = getattr(self.tabicl, "n_estimators", 1)
+        if self.refinement_cfg.aoe_class is not None:
+            aoe_mask = (labels == self.refinement_cfg.aoe_class)
 
         (refined_support, new_pca, weights_ridge, ridge_model, feature_scaler, scoring_clf,
          fit_time_s, pool_time_s) = refine_dataset_features(
@@ -255,19 +234,11 @@ class PALPooler:
             train_labels=labels,
             support_features=support,
             pca=current_pca,
-            n_estimators=n_estimators,
-            temperature=self.temperature,
             seed=self.seed,
-            batch_size=self.batch_size,
-            weight_method=self.weight_method,
-            ridge_alpha=self.ridge_alpha,
-            normalize_features=self.normalize_features,
-            max_query_rows=self.max_query_rows,
-            use_random_subsampling=self.use_random_subsampling,
             aoe_mask=aoe_mask,
-            aoe_handling=self.aoe_handling,
-            use_gpu_ridge=self.gpu_ridge,
             gpu_ridge_device=self.gpu_ridge_device,
+            tabicl = self.tabicl,
+            refinement_cfg=self.refinement_cfg,
         )
 
         # Derive raw (pre-PCA) support in the original D-dimensional DINO space.
@@ -313,7 +284,7 @@ class PALPooler:
         """
         self._check_fitted()
         patches = np.asarray(patches, dtype=np.float32)
-        grouped = group_patches(patches, self.patch_group_size)      # [N, P', D]
+        grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)      # [N, P', D]
         weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)  # [N, P']
         return (weights[:, :, None] * grouped).sum(axis=1)           # [N, D]
 
@@ -369,7 +340,7 @@ class PALPooler:
         if single:
             patches = patches[None]
         patches = np.asarray(patches, dtype=np.float32)
-        grouped = group_patches(patches, self.patch_group_size)
+        grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)
         weights = _ridge_pool_weights(grouped, self.ridge_model_, self.feature_scaler_)
         return weights[0] if single else weights
 
@@ -399,7 +370,7 @@ class PALPooler:
             patches = patches[None]
         patches = np.asarray(patches, dtype=np.float32)
         N, P, D = patches.shape
-        grouped = group_patches(patches, self.patch_group_size)   # [N, P', D]
+        grouped = group_patches(patches, self.refinement_cfg.patch_group_sizes)   # [N, P', D]
         _, P_prime, _ = grouped.shape
         flat = grouped.reshape(N * P_prime, D)
         if self.feature_scaler_ is not None:
@@ -500,11 +471,11 @@ class PALPooler:
         )
         return (
             f"PALPooler("
-            f"patch_group_size={self.patch_group_size}, "
-            f"weight_method='{self.weight_method}', "
-            f"temperature={self.temperature}, "
-            f"ridge_alpha={self.ridge_alpha}, "
-            f"pca_dim={self.pca_dim}, "
+            f"patch_group_size={self.refinement_cfg.patch_group_size}, "
+            f"weight_method='{self.refinement_cfg.weight_method}', "
+            f"temperature={self.refinement_cfg.temperature}, "
+            f"ridge_alpha={self.refinement_cfg.ridge_alpha}, "
+            f"pca_dim={self.refinement_cfg.tabicl_pca_dim}, "
             f"[{status}])"
         )
 
@@ -568,36 +539,16 @@ class IterativePALPooler:
     def __init__(
         self,
         tabicl: TabICLClassifier,
-        patch_group_sizes: List[int],
-        weight_method: str = "correct_class_prob",
-        temperature: Union[float, List[float]] = 1.0,
-        ridge_alpha: Union[float, List[float]] = 1.0,
-        max_query_rows: Optional[int] = None,
-        use_random_subsampling: bool = False,
-        pca_dim: Optional[int] = 128,
-        batch_size: int = 1000,
-        seed: int = 42,
-        aoe_class: Optional[int] = None,
-        aoe_handling: str = "filter",
-        gpu_ridge: bool = False,
+        refinement_cfg: RefinementConfig,
         gpu_ridge_device: str = "cuda",
-        normalize_features: bool = False,
+        seed: int = 42,
     ) -> None:
         self.tabicl = tabicl
-        self.patch_group_sizes = list(patch_group_sizes)
-        self.weight_method = weight_method
-        self.temperature = temperature
-        self.ridge_alpha = ridge_alpha
-        self.max_query_rows = max_query_rows
-        self.use_random_subsampling = use_random_subsampling
-        self.pca_dim = pca_dim
-        self.batch_size = batch_size
+        self.refinement_cfg = refinement_cfg
+        self.patch_group_sizes = list(refinement_cfg.patch_group_sizes)
+        self.pca_dim = refinement_cfg.tabicl_pca_dim
         self.seed = seed
-        self.aoe_class = aoe_class
-        self.aoe_handling = aoe_handling
-        self.gpu_ridge = gpu_ridge
         self.gpu_ridge_device = gpu_ridge_device
-        self.normalize_features = normalize_features
 
     # ------------------------------------------------------------------
     # Core API
@@ -625,33 +576,31 @@ class IterativePALPooler:
         if n_stages == 0:
             raise ValueError("patch_group_sizes must contain at least one entry.")
 
-        temps = self._expand_param(self.temperature, n_stages, "temperature")
-        alphas = self._expand_param(self.ridge_alpha, n_stages, "ridge_alpha")
+        temps = self._expand_param(self.refinement_cfg.temperature, n_stages, "temperature")
+        alphas = self._expand_param(self.refinement_cfg.ridge_alpha, n_stages, "ridge_alpha")
 
         stages: List[PALPooler] = []
         initial_support: Optional[np.ndarray] = None
         initial_pca: Optional[PCA] = None
 
+        print("Patch shape", patches.shape)
+
         for k, group_size in enumerate(self.patch_group_sizes):
             print(f"[IterativePALPooler] Stage {k}/{n_stages - 1} "
                   f"— patch_group_size={group_size}, "
                   f"temperature={temps[k]}, ridge_alpha={alphas[k]}")
+            
+
+            iteration_k_refinement_cfg = copy.deepcopy(self.refinement_cfg)
+            iteration_k_refinement_cfg.patch_group_sizes = group_size
+            iteration_k_refinement_cfg.temperature = temps[k]
+            iteration_k_refinement_cfg.ridge_alpha = alphas[k]
+
             stage = PALPooler(
                 tabicl=self.tabicl,
-                patch_group_size=group_size,
-                weight_method=self.weight_method,
-                temperature=temps[k],
-                ridge_alpha=alphas[k],
-                max_query_rows=self.max_query_rows,
-                use_random_subsampling=self.use_random_subsampling,
-                pca_dim=self.pca_dim,
-                batch_size=self.batch_size,
+                refinement_cfg=iteration_k_refinement_cfg,
                 seed=self.seed,
-                aoe_class=self.aoe_class,
-                aoe_handling=self.aoe_handling,
-                gpu_ridge=self.gpu_ridge,
                 gpu_ridge_device=self.gpu_ridge_device,
-                normalize_features=self.normalize_features,
             )
             stage.fit(patches, labels, initial_support=initial_support, initial_pca=initial_pca)
             stages.append(stage)
@@ -758,12 +707,15 @@ class IterativePALPooler:
     @staticmethod
     def _expand_param(param, n_stages: int, name: str) -> list:
         if isinstance(param, list):
-            if len(param) != n_stages:
-                raise ValueError(
-                    f"{name} list has {len(param)} entries but patch_group_sizes "
-                    f"has {n_stages} stages."
-                )
-            return param
+            if len(param) == 1:
+                return param * n_stages
+            else:
+                if len(param) != n_stages:
+                    raise ValueError(
+                        f"{name} list has {len(param)} entries but patch_group_sizes "
+                        f"has {n_stages} stages."
+                    )
+                return param
         return [param] * n_stages
 
     def _check_fitted(self) -> None:
@@ -780,8 +732,8 @@ class IterativePALPooler:
                 for s in self.stages_
             ]
         else:
-            temps = self._expand_param(self.temperature, len(self.patch_group_sizes), "temperature")
-            alphas = self._expand_param(self.ridge_alpha, len(self.patch_group_sizes), "ridge_alpha")
+            temps = self._expand_param(self.refinement_cfg.temperature, len(self.patch_group_sizes), "temperature")
+            alphas = self._expand_param(self.refinement_cfg.ridge_alpha, len(self.patch_group_sizes), "ridge_alpha")
             stage_strs = [
                 f"g{g}(T={t}, α={a})"
                 for g, t, a in zip(self.patch_group_sizes, temps, alphas)
@@ -791,3 +743,13 @@ class IterativePALPooler:
             f"{'fitted' if fitted else 'not fitted'}: "
             f"[{', '.join(stage_strs)}])"
         )
+
+
+def pooler_factory(refinement_cfg: RefinementConfig, seed: int) -> PALPooler:
+    """Convenience factory to build a PALPooler from config dataclasses."""
+    tabicl = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
+    
+    pooler = IterativePALPooler(tabicl=tabicl, 
+                                refinement_cfg=refinement_cfg, 
+                                seed=seed)
+    return pooler

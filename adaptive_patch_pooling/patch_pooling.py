@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
-from adaptive_patch_pooling.config import RefinementConfig, TabICLConfig
+from adaptive_patch_pooling.config import RefinementConfig
 from tabicl import TabICLClassifier
 from tqdm import tqdm
 
@@ -349,23 +349,13 @@ def refine_dataset_features(
     train_patches:      np.ndarray,      # [N, P, D]  raw DINO patch features
     train_labels:       np.ndarray,      # [N]
     support_features:   np.ndarray,      # [N, d]  initial mean-pooled (post-PCA) features
-    tabicl_cfg: TabICLConfig,
     refinement_cfg: RefinementConfig,
     pca:                Optional[PCA],   # PCA fitted on the baseline support set
-    #n_estimators:       int   = 1,
-    temperature:        float = 1.0,
     seed:               int   = 42,
-    #batch_size:         int   = 100,
-    #weight_method:      str   = "correct_class_prob",
-    ridge_alpha:        float = 1.0,
-    #normalize_features: bool  = False,
-    #max_query_rows:        Optional[int]       = None,
-    #use_random_subsampling: bool               = False,
     aoe_mask:              Optional[np.ndarray] = None,  # [N] bool; True = absence-of-evidence class
-    #aoe_handling:          str                 = "filter",  # "filter" | "entropy"
-    #use_gpu_ridge:         bool                = False,   # solve Ridge normal equations on GPU
-    #gpu_ridge_device:      str                 = "cuda",  # torch device for RidgeGPU
     gpu_ridge_device:      str                 = "cuda",
+    #Optional tabicl classifier
+    tabicl: Optional[TabICLClassifier] = None,
 ) -> tuple[np.ndarray, Optional[PCA], np.ndarray, Union[Ridge, "RidgeGPU"], Optional[StandardScaler], TabICLClassifier, float, float]:
     """Refine mean-pooled support features with Ridge-predicted quality-weighted pooling.
 
@@ -430,6 +420,12 @@ def refine_dataset_features(
     for ``group_size=1`` (P'=196) this is the bottleneck that the GPU eliminates.
     Requires PyTorch with a working CUDA installation.
     """
+    #Assert that refinement_cfg.temperature and refinement_cfg.ridge_alpha are either floats or ints
+    if not isinstance(refinement_cfg.temperature, (int, float)):
+        raise TypeError("refinement_cfg.temperature must be a float or int when forwarded to refine_dataset_features")
+    if not isinstance(refinement_cfg.ridge_alpha, (int, float)):
+        raise TypeError("refinement_cfg.ridge_alpha must be a float or int when forwarded to refine_dataset_features")
+
     t_start = time.perf_counter()
     N, P, D = train_patches.shape
 
@@ -465,7 +461,11 @@ def refine_dataset_features(
         return refinement_cfg.weight_method
 
     # Fit one shared classifier (support set is fixed for all queries this stage)
-    clf = TabICLClassifier(n_estimators=tabicl_cfg.n_estimators, random_state=seed)
+    if tabicl is not None:
+        clf = tabicl
+    else:
+        clf = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
+        
     clf.fit(support_features, train_labels)
 
     # Decide forward-pass strategy:
@@ -507,7 +507,7 @@ def refine_dataset_features(
                 continue
             all_targets[start:end] = compute_patch_quality_logits(
                 probs_flat[start:end], int(active_labels[idx]),
-                temperature, _eff_method(idx), class_prior,
+                refinement_cfg.temperature, _eff_method(idx), class_prior,
             )
 
     else:
@@ -559,12 +559,12 @@ def refine_dataset_features(
         all_features = feature_scaler.fit_transform(all_features)
 
     backend = "GPU" if gpu_ridge_device else "CPU"
-    print(f"[ridge] Fitting Ridge(alpha={ridge_alpha}) on {len(all_features):,} patch samples "
+    print(f"[ridge] Fitting Ridge(alpha={refinement_cfg.ridge_alpha}) on {len(all_features):,} patch samples "
           f"(D={D}, method={refinement_cfg.weight_method}, backend={backend}) ...")
     if gpu_ridge_device:
-        ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=ridge_alpha, device=gpu_ridge_device)
+        ridge_model: Union[Ridge, RidgeGPU] = RidgeGPU(alpha=refinement_cfg.ridge_alpha, device=gpu_ridge_device)
     else:
-        ridge_model = Ridge(alpha=ridge_alpha)
+        ridge_model = Ridge(alpha=refinement_cfg.ridge_alpha)
     ridge_model.fit(all_features, all_targets)
     print(f"[ridge] Train R²: {ridge_model.score(all_features, all_targets):.4f}")
 

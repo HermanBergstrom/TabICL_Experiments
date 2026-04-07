@@ -17,12 +17,6 @@ class DatasetConfig:
     n_sample: int
     balance_train: bool
     balance_test: bool
-
-@dataclass
-class TabICLConfig:
-    n_estimators: int
-    pca_dim: Optional[int]
-
 @dataclass
 class RefinementConfig:
     refine: bool
@@ -38,6 +32,8 @@ class RefinementConfig:
     aoe_class: Optional[str]
     aoe_handling: str
     gpu_ridge: bool
+    tabicl_n_estimators: int
+    tabicl_pca_dim: Optional[int]
 
 @dataclass
 class AttentionPoolConfig:
@@ -49,6 +45,8 @@ class AttentionPoolConfig:
     attn_num_queries: int
     attn_num_heads: int
     device: str
+    tabicl_n_estimators: int
+    tabicl_pca_dim: Optional[int]
 
 @dataclass
 class RunConfig:
@@ -59,7 +57,6 @@ class RunConfig:
 @dataclass
 class ExperimentConfig:
     dataset: DatasetConfig
-    tabicl: TabICLConfig
     refinement: RefinementConfig
     attention: AttentionPoolConfig
     run: RunConfig
@@ -168,11 +165,6 @@ def parse_args() -> ExperimentConfig:
         balance_test=args.balance_test
     )
     
-    tabicl_cfg = TabICLConfig(
-        n_estimators=args.n_estimators,
-        pca_dim=pca_dim,
-    )
-    
     refinement_cfg = RefinementConfig(
         refine=args.refine,
         patch_size=args.patch_size,
@@ -186,7 +178,9 @@ def parse_args() -> ExperimentConfig:
         use_random_subsampling=args.use_random_subsampling,
         aoe_class=args.aoe_class,
         aoe_handling=args.aoe_handling,
-        gpu_ridge=args.gpu_ridge
+        gpu_ridge=args.gpu_ridge,
+        tabicl_n_estimators=args.n_estimators,
+        tabicl_pca_dim=pca_dim,
     )
     
     attention_cfg = AttentionPoolConfig(
@@ -197,7 +191,9 @@ def parse_args() -> ExperimentConfig:
         attn_max_step_samples=args.attn_max_step_samples,
         attn_num_queries=args.attn_num_queries,
         attn_num_heads=args.attn_num_heads,
-        device=args.device
+        device=args.device,
+        tabicl_n_estimators=args.n_estimators,
+        tabicl_pca_dim=pca_dim,
     )
     
     run_cfg = RunConfig(
@@ -208,10 +204,8 @@ def parse_args() -> ExperimentConfig:
     
     return ExperimentConfig(
         dataset=dataset_cfg,
-        tabicl=tabicl_cfg,
         refinement=refinement_cfg,
         attention=attention_cfg,
         run=run_cfg,
         seed=args.seed,
-        #cli_args=vars(args)
     )
