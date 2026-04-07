@@ -420,7 +420,6 @@ patches together.
 | `compute_patch_quality_logits(dist, true_label, temperature, weight_method, class_prior)` | Pre-normalisation quality logits `[P]`; used as Ridge regression targets; `class_prior` required for `kl_div` |
 | `group_patches(patches, patch_group_size)` | Mean-pool spatially adjacent patches into groups; `[N, P, D]` → `[N, P', D]` |
 | `_ridge_pool_weights(patches, ridge_model, feature_scaler)` | Per-patch softmax weights from a fitted Ridge model `[N, P]` |
-| `_mix_and_project(repooled_raw, raw_patches, mix_lambda, pca, seed)` | Mix-lambda blend with mean-pool and re-fit PCA |
 | `refine_dataset_features(train_patches, train_labels, support, pca, ..., aoe_mask, aoe_handling)` | Full refinement pass for one stage; returns `(refined [N,d], new_pca, weights_all [N,P'], ridge_model, feature_scaler, clf)` |
 
 **`adaptive_patch_pooling/patch_visualisation.py`**

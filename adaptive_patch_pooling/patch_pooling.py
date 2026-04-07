@@ -341,33 +341,6 @@ def _ridge_pool_weights(
 
 
 # ---------------------------------------------------------------------------
-# Mix-lambda blending and PCA refit
-# ---------------------------------------------------------------------------
-
-def _mix_and_project(
-    repooled_raw: np.ndarray,    # [N, D]  quality-weighted pooled features
-    raw_patches:  np.ndarray,    # [N, P, D]  original patches (for mean-pool fallback)
-    mix_lambda:   float,
-    pca:          Optional[PCA],
-    seed:         int,
-) -> tuple[np.ndarray, Optional[PCA]]:
-    """Apply mix-lambda blending with mean-pool and re-fit PCA.
-
-    Returns the projected features [N, d] and the newly fitted PCA (or None).
-    """
-    if mix_lambda < 1.0:
-        mean_pooled_raw = raw_patches.astype(np.float32).mean(axis=1)
-        mixed_raw = (mix_lambda * repooled_raw + (1.0 - mix_lambda) * mean_pooled_raw).astype(np.float32)
-    else:
-        mixed_raw = repooled_raw
-
-    if pca is not None:
-        new_pca = PCA(n_components=pca.n_components_, random_state=seed)
-        return new_pca.fit_transform(mixed_raw).astype(np.float32), new_pca
-    return mixed_raw, None
-
-
-# ---------------------------------------------------------------------------
 # Full refinement pass
 # ---------------------------------------------------------------------------
 
@@ -381,7 +354,6 @@ def refine_dataset_features(
     seed:               int   = 42,
     batch_size:         int   = 100,
     weight_method:      str   = "correct_class_prob",
-    mix_lambda:         float = 1.0,
     ridge_alpha:        float = 1.0,
     normalize_features: bool  = False,
     max_query_rows:        Optional[int]       = None,
@@ -429,11 +401,11 @@ def refine_dataset_features(
     5. Predict quality logits for **all** patches of **all** images with Ridge
        (full-image pooling including AoE-class images, regardless of step 2).
     6. Apply softmax weights derived from Ridge logits → ``repooled_raw [N, D]``.
-    7. Mix with mean-pooled raw features (``mix_lambda``) and re-fit PCA.
+    7. Re-fit PCA on the Ridge-pooled raw features.
 
     Returns
     -------
-    mixed : np.ndarray, shape [N, d]
+    refined : np.ndarray, shape [N, d]
     new_pca : PCA or None
     weights_ridge : np.ndarray, shape [N, P]   (Ridge softmax weights, full images)
     ridge_model : Ridge
@@ -603,10 +575,15 @@ def refine_dataset_features(
     weights_ridge = _ridge_pool_weights(train_patches, ridge_model, feature_scaler)   # [N, P]
     repooled_raw  = (weights_ridge[:, :, None] * train_patches).sum(axis=1)           # [N, D]
 
-    mixed, new_pca = _mix_and_project(repooled_raw, train_patches, mix_lambda, pca, seed)
+    if pca is not None:
+        new_pca = PCA(n_components=pca.n_components_, random_state=seed)
+        refined = new_pca.fit_transform(repooled_raw.astype(np.float32)).astype(np.float32)
+    else:
+        refined = repooled_raw.astype(np.float32)
+        new_pca = None
 
     pool_time_s = time.perf_counter() - t_fit_done
     print(f"[timing] fit={fit_time_s:.1f}s  pool={pool_time_s:.1f}s  "
           f"total={fit_time_s + pool_time_s:.1f}s")
 
-    return mixed, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s
+    return refined, new_pca, weights_ridge, ridge_model, feature_scaler, clf, fit_time_s, pool_time_s

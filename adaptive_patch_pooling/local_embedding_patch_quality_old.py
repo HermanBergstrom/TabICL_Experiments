@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+if __package__ in (None, ""):
+	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -723,7 +726,6 @@ def run_patch_quality_eval(
     temperature:       float         = 1.0,
     batch_size:        int           = 10,
     weight_method:     str           = "correct_class_prob",
-    mix_lambda:        float         = 1.0,
     ridge_alpha:       float         = 1.0,
     normalize_features: bool         = False,
     max_query_rows:         Optional[int] = None,
@@ -1065,7 +1067,7 @@ def run_patch_quality_eval(
                 train_grouped, train_labels, current_support, current_pca,
                 n_estimators=n_estimators, temperature=stage_temp, seed=seed,
                 batch_size=batch_size, weight_method=weight_method,
-                mix_lambda=mix_lambda, ridge_alpha=stage_alpha,
+                ridge_alpha=stage_alpha,
                 normalize_features=normalize_features,
                 max_query_rows=max_query_rows,
                 use_random_subsampling=use_random_subsampling,
@@ -1304,9 +1306,6 @@ def _parse_args() -> argparse.Namespace:
                         "rewards patches whose predictions deviate from the base rates, "
                         "making it sensitive to class imbalance. "
                         "All methods are controlled via --temperature.")
-    p.add_argument("--mix-lambda",     type=float, default=1.0,
-                   help="Interpolation weight between refined and mean-pooled embeddings "
-                        "(1.0 → fully refined, 0.0 → fully mean-pooled; requires --refine)")
     p.add_argument("--ridge-alpha",  type=float, nargs="+",  default=[1.0],
                    help="Regularisation strength for the Ridge quality model. "
                         "Pass one value to use it for all stages, or one value per entry in "
@@ -1410,7 +1409,6 @@ if __name__ == "__main__":
         temperature=args.temperature,
         batch_size=args.batch_size,
         weight_method=args.weight_method,
-        mix_lambda=args.mix_lambda,
         ridge_alpha=args.ridge_alpha,
         normalize_features=args.normalize_features,
         max_query_rows=args.max_query_rows,
