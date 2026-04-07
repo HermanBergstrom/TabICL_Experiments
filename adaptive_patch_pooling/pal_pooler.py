@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 from sklearn.decomposition import PCA
@@ -86,48 +86,16 @@ class PALPooler:
     tabicl : TabICLClassifier
         Pre-initialized (unfitted) TabICL model whose ``n_estimators`` and
         ``random_state`` are forwarded to the internal quality scorer.
-    patch_group_size : int
-        Spatial grouping factor before pooling.  Must be a perfect square
-        (1, 4, 9, …).  ``1`` = individual patches (no grouping).
-    weight_method : str
-        Quality scoring method.  One of:
-        ``"correct_class_prob"`` (log true-class probability),
-        ``"entropy"`` (normalised Shannon entropy, label-agnostic),
-        ``"kl_div"`` (KL divergence from empirical class prior, label-agnostic).
-    temperature : float
-        Softmax temperature applied to quality logits.
-        Large → uniform / mean pooling.  Small → peaked on best patch.
-    ridge_alpha : float
-        Ridge regularisation strength (same semantics as ``sklearn.linear_model.Ridge``).
-    max_query_rows : int or None
-        Maximum number of ``(image × patch)`` rows forwarded to TabICL in a
-        single call.  ``None`` = no limit (all active rows in batches of
-        ``batch_size`` images).
-    use_random_subsampling : bool
-        When active rows exceed ``max_query_rows``, draw a random subset of
-        that many rows instead of processing all rows in batches.
-    pca_dim : int or None
-        Number of PCA components used internally for the support.
-        ``None`` disables internal PCA (full D-dimensional DINO features are
-        used for TabICL scoring).
-    batch_size : int
-        Images per batch in the batched TabICL forward pass (only used when
-        ``max_query_rows`` is ``None`` or the row count is below the cap).
+    refinement_cfg : RefinementConfig
+        All pooling hyperparameters: ``patch_group_sizes``, ``temperature``,
+        ``ridge_alpha``, ``weight_method``, ``tabicl_pca_dim``, etc.
+        When used inside :class:`IterativePALPooler`, a per-stage copy with
+        ``patch_group_sizes`` set to a single int is passed here.
     seed : int
         Random seed for PCA, subsampling, and TabICL initialisation.
-    aoe_class : int or None
-        Class index of the absence-of-evidence class.  Triggers special
-        handling during Ridge fitting (controlled by ``aoe_handling``).
-    aoe_handling : str
-        How to handle AoE patches during Ridge fitting.
-        ``"filter"`` excludes them; ``"entropy"`` includes them but scores
-        them with the label-agnostic entropy method.
-    gpu_ridge : bool
-        Solve the Ridge normal equations on the GPU (requires PyTorch + CUDA).
     gpu_ridge_device : str
-        Torch device string for ``RidgeGPU`` (e.g. ``"cuda"``, ``"cuda:1"``).
-    normalize_features : bool
-        Fit a ``StandardScaler`` on training patches before Ridge fitting.
+        Torch device string for GPU-accelerated Ridge (e.g. ``"cuda"``).
+        Only relevant when ``refinement_cfg.gpu_ridge`` is ``True``.
     Fitted attributes (available after ``fit``)
     -------------------------------------------
     ridge_model_ : Ridge or RidgeGPU
@@ -471,7 +439,7 @@ class PALPooler:
         )
         return (
             f"PALPooler("
-            f"patch_group_size={self.refinement_cfg.patch_group_size}, "
+            f"patch_group_sizes={self.refinement_cfg.patch_group_sizes}, "
             f"weight_method='{self.refinement_cfg.weight_method}', "
             f"temperature={self.refinement_cfg.temperature}, "
             f"ridge_alpha={self.refinement_cfg.ridge_alpha}, "
@@ -493,39 +461,15 @@ class IterativePALPooler:
     ----------
     tabicl : TabICLClassifier
         Pre-initialized (unfitted) TabICL model shared across all stages.
-    patch_group_sizes : list of int
-        Ordered list of spatial grouping factors, one per stage.  Each must be
-        a perfect square (1, 4, 9, …).  Example: ``[4, 1]`` runs a coarse
-        group-of-4 stage followed by an individual-patch stage.
-    weight_method : str
-        Quality scoring method passed to every stage (see :class:`PALPooler`).
-    temperature : float or list of float
-        Softmax temperature.  A single value is broadcast to all stages; a list
-        must have one entry per stage.
-    ridge_alpha : float or list of float
-        Ridge regularisation strength.  A single value is broadcast to all
-        stages; a list must have one entry per stage.
-    max_query_rows : int or None
-        Forwarded to every stage unchanged.
-    use_random_subsampling : bool
-        Forwarded to every stage unchanged.
-    pca_dim : int or None
-        Internal PCA dimension used at each stage for building the compact
-        support fed to TabICL.  ``None`` disables internal PCA.
-    batch_size : int
-        Forwarded to every stage unchanged.
+    refinement_cfg : RefinementConfig
+        Pooling hyperparameters shared across all stages.
+        ``patch_group_sizes`` must be a list with one entry per stage;
+        ``temperature`` and ``ridge_alpha`` may be scalars (broadcast) or
+        per-stage lists of the same length.
     seed : int
-        Forwarded to every stage unchanged.
-    aoe_class : int or None
-        Forwarded to every stage unchanged.
-    aoe_handling : str
-        Forwarded to every stage unchanged.
-    gpu_ridge : bool
-        Forwarded to every stage unchanged.
+        Random seed forwarded to every stage.
     gpu_ridge_device : str
-        Forwarded to every stage unchanged.
-    normalize_features : bool
-        Forwarded to every stage unchanged.
+        Torch device string forwarded to every stage (e.g. ``"cuda"``).
     Fitted attributes (available after ``fit``)
     -------------------------------------------
     stages_ : list of PALPooler
@@ -558,7 +502,7 @@ class IterativePALPooler:
         self,
         patches: np.ndarray,
         labels: np.ndarray,
-        stage_callback=None,
+        stage_callback: Optional[Callable] = None,
     ) -> "IterativePALPooler":
         """Fit all stages sequentially, passing the refined support forward.
 
@@ -775,7 +719,7 @@ class IterativePALPooler:
         fitted = hasattr(self, "stages_")
         if fitted:
             stage_strs = [
-                f"g{s.patch_group_size}(T={s.temperature}, α={s.ridge_alpha})"
+                f"g{s.refinement_cfg.patch_group_sizes}(T={s.refinement_cfg.temperature}, α={s.refinement_cfg.ridge_alpha})"
                 for s in self.stages_
             ]
         else:

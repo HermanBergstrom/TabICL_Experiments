@@ -404,6 +404,120 @@ def _merge_attn_into_results(output_dir: Path) -> bool:
     return True
 
 
+def _make_stage_callback(
+    cfg: ExperimentConfig,
+    test_patches: np.ndarray,
+    train_labels: np.ndarray,
+    test_labels: np.ndarray,
+    train_image_paths: list,
+    test_image_paths: list,
+    train_sample_idx: np.ndarray,
+    test_sample_idx: np.ndarray,
+    idx_to_class: dict,
+    open_image,
+    class_prior: np.ndarray,
+    output_dir: Path,
+    all_results: list,
+) -> tuple:
+    """Build the per-stage callback for :class:`IterativePALPooler`.
+
+    Returns ``(callback, last_stage_data)`` where ``last_stage_data`` is a
+    dict that is populated with the final stage's data after ``fit`` completes.
+    The caller can use it for the post-loop final-visualisation pass.
+
+    The returned callback has the signature required by
+    :meth:`IterativePALPooler.fit`::
+
+        callback(stage_idx, stage, group_size,
+                 pre_refine_support, pre_refine_pca, train_grouped)
+
+    It runs (conditionally) pre- and post-refinement visualisations, evaluates
+    test-set accuracy for the stage, appends a result tuple to ``all_results``,
+    and saves the Ridge model to ``output_dir``.
+    """
+    last_stage_data: dict = {}
+
+    def callback(stage_idx, stage, group_size, pre_refine_support, pre_refine_pca, train_grouped):
+        group_side   = int(round(group_size ** 0.5))
+        eff_patch_sz = cfg.refinement.patch_size * group_side
+        tag          = f"iter_{stage_idx}_g{group_size}"
+
+        test_grouped   = group_patches(test_patches, group_size)  # [N_test, P', D]
+        ridge_model    = stage.ridge_model_
+        feature_scaler = stage.feature_scaler_
+        fit_time_s     = stage.fit_time_s_
+        pool_time_s    = stage.pool_time_s_
+        new_support    = stage._support_projected_
+        new_pca        = stage._pca_
+
+        # Pre-refinement visualisation (driven by the input support).
+        if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz:
+            split_configs_iter = [
+                ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
+                ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
+            ]
+            iter_mean_probs = _run_visual_eval(
+                tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
+                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
+                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=cfg.run.output_dir,
+                temperature=stage.refinement_cfg.temperature,
+                ridge_model=None, feature_scaler=None, open_image=open_image,
+                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            )
+        else:
+            iter_mean_probs = {}
+
+        # Save Ridge model to disk.
+        ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
+        joblib.dump(ridge_model, ridge_path)
+        print(f"[ridge] Model saved → {ridge_path}")
+
+        # Post-refinement visualisation (driven by Ridge pooling weights).
+        if cfg.dataset.n_sample > 0 and cfg.run.post_refinement_viz:
+            split_configs_post = [
+                ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
+                ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
+            ]
+            iter_mean_probs = _run_visual_eval(
+                f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
+                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators,
+                patch_size=eff_patch_sz, seed=cfg.seed, output_dir=cfg.run.output_dir,
+                temperature=stage.refinement_cfg.temperature,
+                ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
+                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
+            )
+
+        # Pool test queries with Ridge and evaluate accuracy.
+        w_ridge       = _ridge_pool_weights(test_grouped, ridge_model, feature_scaler)
+        test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)  # [N_test, D]
+        test_query    = (
+            new_pca.transform(test_repooled).astype(np.float32)
+            if new_pca is not None else test_repooled
+        )
+        t_eval_start = time.perf_counter()
+        iter_acc, iter_auroc = _compute_accuracy_from_features(
+            new_support, train_labels, test_query, test_labels,
+            n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
+        )
+        eval_time_s   = time.perf_counter() - t_eval_start
+        refine_time_s = fit_time_s + pool_time_s
+        print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
+              f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
+
+        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
+
+        # Persist state needed by the post-loop final-visualisation block.
+        last_stage_data.update(
+            tag=tag, eff_patch_sz=eff_patch_sz,
+            train_grouped=train_grouped, test_grouped=test_grouped,
+            ridge_model=ridge_model, feature_scaler=feature_scaler,
+            pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
+            temperature=stage.refinement_cfg.temperature,
+        )
+
+    return callback, last_stage_data
+
+
 def run_patch_quality_eval(
     cfg: ExperimentConfig,
 ) -> None:
@@ -675,93 +789,25 @@ def run_patch_quality_eval(
         ("baseline", baseline_acc, baseline_auroc, baseline_mean_probs, 0.0, 0.0, 0.0, 0.0)
     ]
 
-    # State saved by the callback so the post-loop final-viz block can use it.
-    _last_stage_data: dict = {}
-
-    def _stage_callback(stage_idx, stage, group_size, pre_refine_support, pre_refine_pca, train_grouped):
-        """Per-stage hook: visualise, evaluate accuracy, and record results."""
-        group_side   = int(round(group_size ** 0.5))
-        eff_patch_sz = cfg.refinement.patch_size * group_side
-        tag          = f"iter_{stage_idx}_g{group_size}"
-
-        test_grouped = group_patches(test_patches, group_size)  # [N_test, P', D]
-
-        ridge_model    = stage.ridge_model_
-        feature_scaler = stage.feature_scaler_
-        fit_time_s     = stage.fit_time_s_
-        pool_time_s    = stage.pool_time_s_
-        new_support    = stage._support_projected_
-        new_pca        = stage._pca_
-
-        # -- Visualise patch quality under the *input* support (before refinement) --
-        if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz:
-            split_configs_iter = [
-                ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
-                ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
-            ]
-            iter_mean_probs = _run_visual_eval(
-                tag, pre_refine_support, train_labels, split_configs_iter, idx_to_class,
-                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
-                seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=stage.refinement_cfg.temperature,
-                ridge_model=None, feature_scaler=None, open_image=open_image,
-                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
-            )
-        else:
-            iter_mean_probs = {}
-
-        # -- Save Ridge model to disk --
-        ridge_path = output_dir / f"ridge_quality_model_{tag}.joblib"
-        joblib.dump(ridge_model, ridge_path)
-        print(f"[ridge] Model saved → {ridge_path}")
-
-        # -- Post-refinement visualisation with Ridge pooling weights --
-        if cfg.dataset.n_sample > 0 and cfg.run.post_refinement_viz:
-            split_configs_post = [
-                ("train", train_grouped, train_labels, train_image_paths, train_sample_idx),
-                ("test",  test_grouped,  test_labels,  test_image_paths,  test_sample_idx),
-            ]
-            iter_mean_probs = _run_visual_eval(
-                f"{tag}_post", pre_refine_support, train_labels, split_configs_post, idx_to_class,
-                pca=pre_refine_pca, n_estimators=cfg.refinement.tabicl_n_estimators, patch_size=eff_patch_sz,
-                seed=cfg.seed, output_dir=cfg.run.output_dir,
-                temperature=stage.refinement_cfg.temperature,
-                ridge_model=ridge_model, feature_scaler=feature_scaler, open_image=open_image,
-                class_prior=class_prior, weight_method=cfg.refinement.weight_method,
-            )
-
-        # -- Pool test queries with Ridge and evaluate accuracy --
-        w_ridge       = _ridge_pool_weights(test_grouped, ridge_model, feature_scaler)
-        test_repooled = (w_ridge[:, :, None] * test_grouped).sum(axis=1)  # [N_test, D]
-        test_query    = (
-            new_pca.transform(test_repooled).astype(np.float32)
-            if new_pca is not None else test_repooled
-        )
-
-        t_eval_start = time.perf_counter()
-        iter_acc, iter_auroc = _compute_accuracy_from_features(
-            new_support, train_labels, test_query, test_labels,
-            n_estimators=cfg.refinement.tabicl_n_estimators, seed=cfg.seed,
-        )
-        eval_time_s = time.perf_counter() - t_eval_start
-        refine_time_s = fit_time_s + pool_time_s
-        print(f"[{tag}] test accuracy (quality-pooled queries): {iter_acc:.4f}  auroc: {iter_auroc:.4f}  "
-              f"(fit {fit_time_s:.1f}s, pool {pool_time_s:.1f}s, eval {eval_time_s:.1f}s)")
-
-        all_results.append((tag, iter_acc, iter_auroc, iter_mean_probs, refine_time_s, eval_time_s, fit_time_s, pool_time_s))
-
-        # Persist data needed by the post-loop final-viz block.
-        _last_stage_data.update(
-            tag=tag, eff_patch_sz=eff_patch_sz,
-            train_grouped=train_grouped, test_grouped=test_grouped,
-            ridge_model=ridge_model, feature_scaler=feature_scaler,
-            pre_refine_support=pre_refine_support, pre_refine_pca=pre_refine_pca,
-            temperature=stage.refinement_cfg.temperature,
-        )
+    stage_callback, _last_stage_data = _make_stage_callback(
+        cfg=cfg,
+        test_patches=test_patches,
+        train_labels=train_labels,
+        test_labels=test_labels,
+        train_image_paths=train_image_paths,
+        test_image_paths=test_image_paths,
+        train_sample_idx=train_sample_idx,
+        test_sample_idx=test_sample_idx,
+        idx_to_class=idx_to_class,
+        open_image=open_image,
+        class_prior=class_prior,
+        output_dir=output_dir,
+        all_results=all_results,
+    )
 
     tabicl_clf = TabICLClassifier(n_estimators=cfg.refinement.tabicl_n_estimators, random_state=cfg.seed)
     pal_pooler = IterativePALPooler(tabicl=tabicl_clf, refinement_cfg=cfg.refinement, seed=cfg.seed)
-    pal_pooler.fit(train_patches, train_labels, stage_callback=_stage_callback)
+    pal_pooler.fit(train_patches, train_labels, stage_callback=stage_callback)
 
     # -- Final post-all-refinement visualisation (only when --post-refinement-viz is off) --
     # Produces Ridge-weight figures for the last refinement stage, giving you the quality
