@@ -360,7 +360,7 @@ class PALPooler:
         + AUROC on the query set.
 
         This mirrors the ``_compute_accuracy_from_features`` evaluation step
-        in ``local_embedding_patch_quality.py``.
+        in ``pal_experiment.py``.
 
         Parameters
         ----------
@@ -453,7 +453,7 @@ class IterativePALPooler:
 
     Each stage fits a :class:`PALPooler`, refines the support, and passes the
     refined projected support to the next stage as its starting point — exactly
-    replicating the iterative loop in ``local_embedding_patch_quality.py``.
+    replicating the iterative loop in ``pal_experiment.py``.
     After fitting, all transform / scoring calls are delegated to the final
     stage.
 
@@ -554,8 +554,6 @@ class IterativePALPooler:
         else:
             initial_pca = None
             initial_support = support_raw
-
-        print("Patch shape", patches.shape)
 
         for k, group_size in enumerate(self.patch_group_sizes):
             from adaptive_patch_pooling.patch_pooling import group_patches
@@ -736,7 +734,7 @@ class IterativePALPooler:
         )
 
 
-def pooler_factory(refinement_cfg: RefinementConfig, seed: int) -> PALPooler:
+def pooler_factory(refinement_cfg: RefinementConfig, seed: int) -> IterativePALPooler:
     """Convenience factory to build a PALPooler from config dataclasses."""
     tabicl = TabICLClassifier(n_estimators=refinement_cfg.tabicl_n_estimators, random_state=seed)
     

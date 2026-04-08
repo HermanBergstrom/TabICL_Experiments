@@ -1,13 +1,10 @@
-"""Patch-quality evaluation: are individual DINOv3 patch embeddings discriminative?
+"""PAL (Patch-quality Adaptive Lookup) experiment runner.
 
-For each sampled training image we:
-  1. Build a support set from *mean-pooled* training embeddings (one row per image).
-  2. Feed every patch of the sampled image as an individual TabICL query.
-  3. Record how many patches predict the correct class.
-  4. Visualise the results overlaid on the original image.
+Evaluates iterative multi-scale quality-weighted patch pooling against mean-pool and
+CLS-token baselines, with optional attention-pooling and patch-quality visualisations.
 
 Usage:
-    python local_embedding_patch_quality.py \\
+    python adaptive_patch_pooling/pal_experiment.py \\
         [--n-sample 8] [--n-estimators 1] [--pca-dim 128] \\
         [--seed 42] [--output-dir patch_quality_results]
 """
@@ -297,25 +294,30 @@ def _run_attn_only(
     output_dir:           Path,
     attn_cfg:             AttentionPoolConfig,
     seed:                 int,
-) -> None:
-    """Train the attention pooling head and save results to attn_pool_results.json.
+    cfg:                  ExperimentConfig,
+) -> dict:
+    """Train the attention pooling head, save results to attn_pool_results.json, and return the result dict.
 
     Checkpoint selection uses the best validation accuracy from the training loop
     (full 768-dim features via the frozen TabICL backbone).  The reported test
     accuracy is evaluated post-hoc: pool train with the best head, fit PCA if
     pca_dim is set, then call TabICLClassifier on the PCA-reduced features —
     matching the dimensionality used by all other baselines.
+
+    Returns:
+        dict with keys: test_acc, test_auroc, best_val_acc_raw, best_val_step,
+        time_to_best_s, total_train_time_s.
     """
     import torch as _torch
-    from attention_pooling_experiments import train_attention_pooling_head, _pool_with_head
-    from finetune_projection_head import ProjectionTrainingConfig
+    from adaptive_patch_pooling.attention_pooling import train_attention_pooling_head, _pool_with_head
+    from adaptive_patch_pooling.frozen_tabicl import EpisodicTrainingConfig
 
     if attn_cfg.device == "auto":
         _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
     else:
         _device = _torch.device(attn_cfg.device)
 
-    attn_cfg = ProjectionTrainingConfig(
+    training_cfg = EpisodicTrainingConfig(
         num_steps=attn_cfg.attn_steps,
         learning_rate=attn_cfg.attn_lr,
         max_step_samples=attn_cfg.attn_max_step_samples,
@@ -338,7 +340,7 @@ def _run_attn_only(
         num_queries=attn_cfg.attn_num_queries,
         num_heads=attn_cfg.attn_num_heads,
         device=_device,
-        config=attn_cfg,
+        config=training_cfg,
     )
     total_time_s = time.perf_counter() - t_start
 
@@ -382,6 +384,7 @@ def _run_attn_only(
     with attn_path.open("w") as f:
         json.dump(record, f, indent=2)
     print(f"[attn-pool]  Saved → {attn_path}")
+    return attn_result
 
 
 def _merge_attn_into_results(output_dir: Path) -> bool:
@@ -518,7 +521,7 @@ def _make_stage_callback(
     return callback, last_stage_data
 
 
-def run_patch_quality_eval(
+def run_pal_experiment(
     cfg: ExperimentConfig,
 ) -> None:
     output_dir = Path(cfg.run.output_dir)
@@ -679,71 +682,12 @@ def run_patch_quality_eval(
     # --- Attention pooling upper-bound baseline ---
     attn_result: Optional[dict] = None
     if cfg.attention.attn_pool:
-        import torch as _torch
-        from attention_pooling_experiments import train_attention_pooling_head, _pool_with_head
-        from finetune_projection_head import ProjectionTrainingConfig
-
-        if cfg.attention.device == "auto":
-            _device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-        else:
-            _device = _torch.device(cfg.attention.device)
-
-        external_attn_cfg = ProjectionTrainingConfig(
-            num_steps=cfg.attention.attn_steps,
-            learning_rate=cfg.attention.attn_lr,
-            max_step_samples=cfg.attention.attn_max_step_samples,
-            seed=cfg.attention.seed,
-            log_every=max(1, cfg.attention.attn_steps // 10),
+        attn_result = _run_attn_only(
+            train_patches=train_patches, train_labels=train_labels,
+            test_patches=test_patches,   test_labels=test_labels,
+            D=D, output_dir=output_dir, attn_cfg=cfg.attention,
+            seed=cfg.seed, cfg=cfg,
         )
-        print(f"\n[attn-pool]  Training attention head  "
-              f"(steps={cfg.attention.attn_steps}  lr={cfg.attention.attn_lr}  device={_device}  "
-              f"n_queries={cfg.attention.attn_num_queries}  n_heads={cfg.attention.attn_num_heads})")
-
-        t_attn_start = time.perf_counter()
-        attn_head, attn_history = train_attention_pooling_head(
-            train_patches=_torch.from_numpy(train_patches),
-            y_train=train_labels,
-            val_patches=_torch.from_numpy(test_patches),
-            y_val=test_labels,
-            embed_dim=D,
-            out_dim=None,
-            num_queries=cfg.attention.attn_num_queries,
-            num_heads=cfg.attention.attn_num_heads,
-            device=_device,
-            config=external_attn_cfg,
-        )
-        attn_total_time_s = time.perf_counter() - t_attn_start
-
-        attn_best_val_acc_raw = max(attn_history["val_accuracy"]) if attn_history["val_accuracy"] else float("nan")
-        attn_time_to_best     = attn_history.get("time_to_best_s", float("nan"))
-        attn_best_step        = attn_history.get("best_val_step", 0)
-
-        # Post-hoc evaluation: pool with best checkpoint → PCA → TabICLClassifier
-        from attention_pooling_experiments import _pool_with_head as _attn_pool_fn
-        print(f"[attn-pool]  Evaluating best checkpoint (step {attn_best_step}) with PCA={cfg.attention.tabicl_pca_dim} ...")
-        attn_train_pooled = _attn_pool_fn(attn_head, _torch.from_numpy(train_patches), _device)
-        attn_test_pooled  = _attn_pool_fn(attn_head, _torch.from_numpy(test_patches),  _device)
-        if cfg.attention.tabicl_pca_dim is not None:
-            n_comp_attn       = min(cfg.attention.tabicl_pca_dim, len(train_labels), attn_train_pooled.shape[1])
-            attn_pca          = PCA(n_components=n_comp_attn, random_state=cfg.seed)
-            attn_train_pooled = attn_pca.fit_transform(attn_train_pooled).astype(np.float32)
-            attn_test_pooled  = attn_pca.transform(attn_test_pooled).astype(np.float32)
-        attn_test_acc, attn_test_auroc = _compute_accuracy_from_features(
-            attn_train_pooled, train_labels, attn_test_pooled, test_labels,
-            n_estimators=cfg.attention.tabicl_n_estimators, seed=cfg.seed,
-        )
-
-        attn_result = {
-            "test_acc":           round(attn_test_acc, 6),
-            "test_auroc":         round(attn_test_auroc, 6) if not np.isnan(attn_test_auroc) else None,
-            "best_val_acc_raw":   round(attn_best_val_acc_raw, 6),
-            "best_val_step":      attn_best_step,
-            "time_to_best_s":     attn_time_to_best,
-            "total_train_time_s": round(attn_total_time_s, 2),
-        }
-        print(f"[attn-pool]  test acc (PCA={cfg.attention.tabicl_pca_dim}): {attn_test_acc:.4f}  auroc: {attn_test_auroc:.4f}  "
-              f"(best train val: {attn_best_val_acc_raw:.4f}  "
-              f"step {attn_best_step}/{cfg.attention.attn_steps}  time_to_best={attn_time_to_best:.1f}s)")
 
     if cfg.dataset.n_sample > 0 and not cfg.run.post_refinement_viz:
         split_configs_orig = [
@@ -885,7 +829,7 @@ def run_n_train_sweep(
     Args:
         n_train_values: Ordered list of support-set sizes to evaluate.
         base_output_dir: Root directory; per-run sub-dirs are created here.
-        **kwargs: Forwarded verbatim to ``run_patch_quality_eval`` (except
+        **kwargs: Forwarded verbatim to ``run_pal_experiment`` (except
             ``n_train`` and ``output_dir``, which are set per-run).
     """
 
@@ -908,7 +852,7 @@ def run_n_train_sweep(
         run_cfg.dataset.n_train = n_train
         run_cfg.run.output_dir = str(run_dir)
 
-        run_patch_quality_eval(
+        run_pal_experiment(
             run_cfg
         )
 
@@ -955,6 +899,6 @@ if __name__ == "__main__":
             cfg=cfg,
         )
     else:
-        run_patch_quality_eval(
+        run_pal_experiment(
             cfg,
         )
